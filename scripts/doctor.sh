@@ -20,7 +20,9 @@ esac
 if claude mcp get void >/dev/null 2>&1; then ok "Claude Code MCP: void"; else bad "Claude Code MCP not registered" "claude mcp add --scope user void -- $VOID mcp"; fi
 if codex mcp get void >/dev/null 2>&1; then ok "Codex MCP: void"; else bad "Codex MCP not registered" "codex mcp add void -- $VOID mcp"; fi
 
-if openclaw cron list 2>/dev/null | grep -q 'disk-guard'; then ok "OpenClaw cron: disk-guard"; else bad "OpenClaw disk-guard job missing" "DISCORD_TO=... DISCORD_ACCOUNT=... sh openclaw/disk-guard/install.sh"; fi
+if launchctl print "gui/$(id -u)/dev.sweepy.check" >/dev/null 2>&1; then ok "launchd: dev.sweepy.check"; else bad "sweepy schedule not installed" "bin/sweepy install"; fi
+STATE_DIR="${SWEEPY_STATE_DIR:-$HOME/.local/state/sweepy}"
+if [ -s "$STATE_DIR/sweepy.log" ]; then ok "last check: $(tail -1 "$STATE_DIR/sweepy.log")"; else bad "sweepy has not run yet" "bin/sweepy check"; fi
 
 prompts=$(log show --last 30m --style compact --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"' 2>/dev/null | grep -c 'AUTHREQ_PROMPTING')
 if [ "${prompts:-0}" -eq 0 ]; then ok "no macOS privacy prompts in the last 30m"; else bad "$prompts macOS privacy prompt(s) in the last 30m; scans may hang" "answer the dialog on screen (Don't Allow is fine for cache cleanup)"; fi

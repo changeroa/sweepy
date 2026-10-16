@@ -1,0 +1,95 @@
+#!/bin/sh
+set -eu
+
+VOID="${SWEEPY_VOID:-$HOME/.local/bin/void}"
+STATE_DIR="${SWEEPY_STATE_DIR:-$HOME/.local/state/sweepy}"
+INTERVAL="${SWEEPY_INTERVAL:-3600}"
+REPEAT_AFTER="${SWEEPY_REPEAT_AFTER:-86400}"
+SCAN_TIMEOUT="${SWEEPY_SCAN_TIMEOUT:-120}"
+LABEL=dev.sweepy.check
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+VOID_CONFIG="${SWEEPY_VOID_CONFIG:-$(dirname "$(dirname "$SELF")")/void/sweepy.json}"
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$STATE_DIR/sweepy.log"; }
+field() { plutil -extract "$1" raw -o - "$2" 2>/dev/null; }
+
+check() {
+  mkdir -p "$STATE_DIR/reports"
+  guard="$STATE_DIR/guard.json"
+  "$VOID" --json --config "$VOID_CONFIG" guard check > "$guard" 2>/dev/null || true
+  state=$(field state "$guard") || state=error
+
+  now=$(date +%s)
+  last=none fired=0
+  [ -f "$STATE_DIR/last" ] && read -r last fired < "$STATE_DIR/last"
+
+  if [ "$state" = ok ]; then
+    echo "ok $fired" > "$STATE_DIR/last"
+    log "ok $(field free_percent "$guard")%"
+    return 0
+  fi
+  if [ "$state" = "$last" ] && [ $((now - fired)) -lt "$REPEAT_AFTER" ]; then
+    log "$state (reported at $fired, not repeating)"
+    return 0
+  fi
+
+  report="$STATE_DIR/reports/$(date +%Y%m%d-%H%M%S).json"
+  plan="$STATE_DIR/plan.json"
+  plan_error=""
+  if ! perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$SCAN_TIMEOUT" "$VOID" --json --config "$VOID_CONFIG" plan --stale-days 14 \
+      -p "$HOME/projects" -k node_modules -k target_dir -k framework_build_cache -k pycache_dir \
+      > "$plan" 2>/dev/null || [ ! -s "$plan" ]; then
+    prompts=$(command log show --last 10m --style compact \
+      --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"' 2>/dev/null \
+      | grep -c AUTHREQ_PROMPTING || true)
+    plan_error="plan failed or exceeded ${SCAN_TIMEOUT}s; macOS privacy prompts in last 10m: ${prompts:-0}"
+  fi
+
+  {
+    printf '{"state":"%s","guard":' "$state"
+    if [ "$state" = error ]; then printf 'null'; else cat "$guard"; fi
+    printf ',"plan":'
+    if [ -z "$plan_error" ]; then cat "$plan"; else printf 'null,"plan_error":"%s"' "$plan_error"; fi
+    printf '}\n'
+  } > "$report"
+
+  echo "$state $now" > "$STATE_DIR/last"
+  log "$state -> $report${plan_error:+ ($plan_error)}"
+  echo "$report"
+}
+
+install() {
+  mkdir -p "$STATE_DIR" "$(dirname "$PLIST")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$SELF</string><string>check</string></array>
+  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$STATE_DIR/launchd.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/launchd.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed $LABEL (every ${INTERVAL}s) -> $PLIST"
+}
+
+uninstall() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "removed $LABEL (state kept in $STATE_DIR)"
+}
+
+case "${1:-}" in
+  check) check ;;
+  install) install ;;
+  uninstall) uninstall ;;
+  *) echo "usage: sweepy check|install|uninstall" >&2; exit 2 ;;
+esac
