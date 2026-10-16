@@ -1,95 +1,310 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bun
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir, hostname } from "node:os";
 
-VOID="${SWEEPY_VOID:-$HOME/.local/bin/void}"
-STATE_DIR="${SWEEPY_STATE_DIR:-$HOME/.local/state/sweepy}"
-INTERVAL="${SWEEPY_INTERVAL:-3600}"
-REPEAT_AFTER="${SWEEPY_REPEAT_AFTER:-86400}"
-SCAN_TIMEOUT="${SWEEPY_SCAN_TIMEOUT:-120}"
-LABEL=dev.sweepy.check
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-VOID_CONFIG="${SWEEPY_VOID_CONFIG:-$(dirname "$(dirname "$SELF")")/void/sweepy.json}"
+const HOME = homedir();
+const REPO = dirname(dirname(import.meta.path));
+const STATE = process.env.SWEEPY_STATE_DIR ?? join(HOME, ".local/state/sweepy");
+const VOID = process.env.SWEEPY_VOID ?? join(HOME, ".local/bin/void");
+const POLICY_PATH = process.env.SWEEPY_POLICY ?? join(REPO, "policy.json");
+const SCAN_TIMEOUT_MS = Number(process.env.SWEEPY_SCAN_TIMEOUT ?? 120) * 1000;
+const LABEL = "dev.sweepy.check";
+const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
+const DAY = 86_400_000;
 
-log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$STATE_DIR/sweepy.log"; }
-field() { plutil -extract "$1" raw -o - "$2" 2>/dev/null; }
+type Tier = "auto" | "approve";
+type Kind = "artifact" | "worktree_remove" | "worktree_prune";
+type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string };
+type Excluded = { kind: Kind; path: string; reason: string };
+type Free = { state: string; free_bytes: number; free_percent: number } | null;
+type Proposal = {
+  version: 1; id: string; host: string; createdAt: string; expiresAt: string; autoEnabled: boolean;
+  free: Free; items: Item[]; excluded: Excluded[]; errors: string[];
+};
+type Policy = {
+  roots: string[]; protect: string[];
+  artifacts: { kinds: string[]; ecosystems: string[]; staleDays: number };
+  worktrees: { idleDays: number }; auto: { enabled: boolean };
+  inbox: { minBytes: number }; proposalTtlHours: number;
+};
 
-check() {
-  mkdir -p "$STATE_DIR/reports"
-  guard="$STATE_DIR/guard.json"
-  "$VOID" --json --config "$VOID_CONFIG" guard check > "$guard" 2>/dev/null || true
-  state=$(field state "$guard") || state=error
+function real(p: string): string {
+  const expanded = p.startsWith("~/") ? join(HOME, p.slice(2)) : p;
+  try { return realpathSync(expanded); } catch { return expanded; }
+}
+function loadPolicy(): Policy {
+  const p = JSON.parse(readFileSync(POLICY_PATH, "utf8")) as Policy;
+  return { ...p, roots: p.roots.map(real), protect: p.protect.map(real) };
+}
+const under = (p: string, base: string) => p === base || p.startsWith(base + "/");
+const underAny = (p: string, bases: string[]) => bases.some((b) => under(p, b));
 
-  now=$(date +%s)
-  last=none fired=0
-  [ -f "$STATE_DIR/last" ] && read -r last fired < "$STATE_DIR/last"
+function run(cmd: string[], opts: { cwd?: string; timeoutMs?: number } = {}) {
+  const r = Bun.spawnSync(cmd, { cwd: opts.cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", timeout: opts.timeoutMs });
+  return { code: r.exitCode ?? -1, out: r.stdout.toString(), err: r.stderr.toString(), killed: r.signalCode != null };
+}
+const git = (cwd: string, ...args: string[]) => run(["git", "--no-optional-locks", "-C", cwd, ...args]);
 
-  if [ "$state" = ok ]; then
-    echo "ok $fired" > "$STATE_DIR/last"
-    log "ok $(field free_percent "$guard")%"
-    return 0
-  fi
-  if [ "$state" = "$last" ] && [ $((now - fired)) -lt "$REPEAT_AFTER" ]; then
-    log "$state (reported at $fired, not repeating)"
-    return 0
-  fi
-
-  report="$STATE_DIR/reports/$(date +%Y%m%d-%H%M%S).json"
-  plan="$STATE_DIR/plan.json"
-  plan_error=""
-  if ! perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$SCAN_TIMEOUT" "$VOID" --json --config "$VOID_CONFIG" plan --stale-days 14 \
-      -p "$HOME/projects" -k node_modules -k target_dir -k framework_build_cache -k pycache_dir \
-      > "$plan" 2>/dev/null || [ ! -s "$plan" ]; then
-    prompts=$(command log show --last 10m --style compact \
-      --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"' 2>/dev/null \
-      | grep -c AUTHREQ_PROMPTING || true)
-    plan_error="plan failed or exceeded ${SCAN_TIMEOUT}s; macOS privacy prompts in last 10m: ${prompts:-0}"
-  fi
-
-  {
-    printf '{"state":"%s","guard":' "$state"
-    if [ "$state" = error ]; then printf 'null'; else cat "$guard"; fi
-    printf ',"plan":'
-    if [ -z "$plan_error" ]; then cat "$plan"; else printf 'null,"plan_error":"%s"' "$plan_error"; fi
-    printf '}\n'
-  } > "$report"
-
-  echo "$state $now" > "$STATE_DIR/last"
-  log "$state -> $report${plan_error:+ ($plan_error)}"
-  echo "$report"
+function freeSpace(): Free {
+  const r = run([VOID, "--json", "guard", "check"]);
+  try { return JSON.parse(r.out); } catch { return null; }
+}
+function duBytes(p: string): number {
+  const r = run(["du", "-sk", p]);
+  return (Number(r.out.split(/\s+/)[0]) || 0) * 1024;
+}
+function cwdsInUse(): string[] {
+  return run(["lsof", "-d", "cwd", "-Fn"]).out.split("\n").filter((l) => l.startsWith("n/")).map((l) => l.slice(1));
+}
+function repoRoot(p: string): string {
+  let d = dirname(p);
+  while (d !== "/" && !existsSync(join(d, ".git"))) d = dirname(d);
+  return d;
+}
+function tccPrompts(): number {
+  const r = run(["log", "show", "--last", "10m", "--style", "compact", "--predicate",
+    'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"']);
+  return r.out.split("\n").filter((l) => l.includes("AUTHREQ_PROMPTING")).length;
 }
 
-install() {
-  mkdir -p "$STATE_DIR" "$(dirname "$PLIST")"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
+function findRepos(roots: string[]): string[] {
+  const repos: string[] = [];
+  const skip = new Set(["node_modules", "target", ".git", ".next", ".venv", "venv", "__pycache__"]);
+  const walk = (dir: string, depth: number) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    if (entries.some((e) => e.name === ".git" && e.isDirectory())) repos.push(dir);
+    if (depth === 0) return;
+    for (const e of entries) if (e.isDirectory() && !e.isSymbolicLink() && !skip.has(e.name)) walk(join(dir, e.name), depth - 1);
+  };
+  roots.forEach((r) => walk(r, 4));
+  return repos;
+}
+
+type Worktree = { path: string; repo: string; idleDays: number; locked: boolean };
+
+function scanWorktrees(policy: Policy, inUse: string[], items: Item[], excluded: Excluded[]): Worktree[] {
+  const found: Worktree[] = [];
+  const now = Date.now();
+  for (const repo of findRepos(policy.roots)) {
+    const blocks = git(repo, "worktree", "list", "--porcelain").out.trim().split("\n\n").slice(1);
+    let prunable = 0;
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      const path = real(lines.find((l) => l.startsWith("worktree "))?.slice(9) ?? "");
+      if (lines.some((l) => l.startsWith("prunable"))) { prunable++; continue; }
+      const locked = lines.some((l) => l.startsWith("locked"));
+      const commitMs = Number(git(path, "log", "-1", "--format=%ct").out.trim()) * 1000 || 0;
+      const gitDir = git(path, "rev-parse", "--absolute-git-dir").out.trim();
+      let indexMs = 0;
+      try { indexMs = statSync(join(gitDir, "index")).mtimeMs; } catch {}
+      const idleDays = Math.floor((now - Math.max(commitMs, indexMs)) / DAY);
+      found.push({ path, repo, idleDays, locked });
+
+      const exclude = (reason: string) => excluded.push({ kind: "worktree_remove", path, reason });
+      if (!underAny(path, policy.roots)) { exclude("outside roots"); continue; }
+      if (underAny(path, policy.protect)) { exclude("protected path"); continue; }
+      if (locked) { exclude("locked worktree"); continue; }
+      if (inUse.some((c) => under(c, path))) { exclude("in use by a running process"); continue; }
+      if (idleDays < policy.worktrees.idleDays) { exclude(`active ${idleDays}d ago`); continue; }
+      if (git(path, "status", "--porcelain").out.trim() !== "") { exclude("uncommitted changes"); continue; }
+      const unpushed = Number(git(path, "rev-list", "--count", "HEAD", "--not", "--remotes").out.trim() || "1");
+      if (unpushed > 0) { exclude(`${unpushed} commit(s) not on any remote`); continue; }
+      items.push({ tier: "approve", kind: "worktree_remove", path, repo, bytes: duBytes(path), reason: `clean, pushed, idle ${idleDays}d` });
+    }
+    if (prunable > 0) items.push({ tier: "auto", kind: "worktree_prune", path: repo, repo, bytes: 0, reason: `${prunable} worktree record(s) whose directory is gone` });
+  }
+  return found;
+}
+
+function voidConfig(policy: Policy): string {
+  mkdirSync(STATE, { recursive: true });
+  const p = join(STATE, "void-config.json");
+  writeFileSync(p, JSON.stringify({ scan_roots: policy.roots, enabled_ecosystems: policy.artifacts.ecosystems, blocked_paths: policy.protect }, null, 2));
+  return p;
+}
+
+function scanArtifacts(policy: Policy, worktrees: Worktree[], inUse: string[], items: Item[], excluded: Excluded[], errors: string[]) {
+  const r = run([VOID, "--json", "--config", voidConfig(policy), "scan"], { timeoutMs: SCAN_TIMEOUT_MS });
+  let found: any[];
+  try { found = JSON.parse(r.out); } catch {
+    errors.push(`void scan ${r.killed ? `exceeded ${SCAN_TIMEOUT_MS / 1000}s` : `failed (exit ${r.code})`}; macOS privacy prompts in last 10m: ${tccPrompts()}`);
+    return;
+  }
+  for (const a of found) {
+    if (!policy.artifacts.kinds.includes(a.kind) || !underAny(a.path, policy.roots)) continue;
+    if (!a.available_actions?.some((x: any) => x.risk === "safe" && x.method?.type === "remove_dir")) continue;
+    const exclude = (reason: string) => excluded.push({ kind: "artifact", path: a.path, reason });
+    if (underAny(a.path, policy.protect)) { exclude("protected path"); continue; }
+    const project = repoRoot(a.path);
+    if (inUse.some((c) => under(c, project))) { exclude("project in use by a running process"); continue; }
+    const base = { kind: "artifact" as const, path: a.path, bytes: a.size_bytes ?? 0, artifactKind: a.kind };
+    const wt = worktrees.find((w) => under(a.path, w.path));
+    if (wt) {
+      if (wt.idleDays >= policy.worktrees.idleDays && !wt.locked) items.push({ ...base, tier: "auto", reason: `inside worktree idle ${wt.idleDays}d` });
+      else exclude(`inside active worktree (${wt.idleDays}d)`);
+      continue;
+    }
+    if ((a.days_stale ?? 0) >= policy.artifacts.staleDays) items.push({ ...base, tier: "approve", reason: `untouched ${a.days_stale}d` });
+  }
+}
+
+function scan(): Proposal {
+  const policy = loadPolicy();
+  const items: Item[] = [], excluded: Excluded[] = [], errors: string[] = [];
+  const inUse = cwdsInUse();
+  const worktrees = scanWorktrees(policy, inUse, items, excluded);
+  scanArtifacts(policy, worktrees, inUse, items, excluded, errors);
+  const now = new Date();
+  const proposal: Proposal = {
+    version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + policy.proposalTtlHours * 3_600_000).toISOString(),
+    autoEnabled: policy.auto.enabled, free: freeSpace(), items, excluded, errors,
+  };
+  mkdirSync(join(STATE, "proposals"), { recursive: true });
+  writeFileSync(join(STATE, "proposals", `${proposal.id}.json`), JSON.stringify(proposal, null, 2));
+  return proposal;
+}
+
+const key = (i: Item) => `${i.kind}|${i.path}`;
+const sum = (xs: Item[]) => xs.reduce((n, i) => n + i.bytes, 0);
+function history(entry: object) {
+  mkdirSync(STATE, { recursive: true });
+  appendFileSync(join(STATE, "history.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+}
+
+function apply(id: string, tier: Tier) {
+  const path = join(STATE, "proposals", `${id}.json`);
+  if (!existsSync(path)) return fail(`unknown proposal ${id}`);
+  const proposal: Proposal = JSON.parse(readFileSync(path, "utf8"));
+  if (Date.parse(proposal.expiresAt) < Date.now()) return fail(`proposal ${id} expired at ${proposal.expiresAt}`);
+
+  const fresh = new Set(scan().items.filter((i) => i.tier === tier).map(key));
+  const wanted = proposal.items.filter((i) => i.tier === tier);
+  const selected = wanted.filter((i) => fresh.has(key(i)));
+  const dropped = wanted.filter((i) => !fresh.has(key(i))).map((i) => ({ path: i.path, kind: i.kind, reason: "no longer eligible" }));
+  const failures: { path: string; error: string }[] = [];
+  const before = freeSpace()?.free_bytes ?? 0;
+
+  const artifacts = selected.filter((i) => i.kind === "artifact");
+  if (artifacts.length > 0) {
+    const policy = loadPolicy();
+    const args = [VOID, "--json", "--config", voidConfig(policy), "plan", "--max-risk", "safe"];
+    for (const k of new Set(artifacts.map((a) => a.artifactKind!))) args.push("-k", k);
+    for (const a of artifacts) args.push("-p", a.path);
+    const plan = run(args, { timeoutMs: SCAN_TIMEOUT_MS });
+    let parsed: any = null;
+    try { parsed = JSON.parse(plan.out); } catch {}
+    const allowed = new Set(artifacts.map((a) => a.path));
+    const extra = parsed?.entries?.filter((e: any) => !allowed.has(e.path)) ?? [];
+    if (!parsed) artifacts.forEach((a) => failures.push({ path: a.path, error: "void plan failed" }));
+    else if (extra.length > 0) artifacts.forEach((a) => failures.push({ path: a.path, error: `void plan included unapproved paths: ${extra.map((e: any) => e.path).join(", ")}` }));
+    else {
+      const res = run([VOID, "--json", "--config", voidConfig(policy), "apply", "--yes", parsed.plan_id], { timeoutMs: 600_000 });
+      try { JSON.parse(res.out).failed.forEach((f: any) => failures.push({ path: f.path, error: f.error })); }
+      catch { failures.push({ path: "(void apply)", error: res.err.slice(-300) || `exit ${res.code}` }); }
+    }
+  }
+  for (const i of selected.filter((i) => i.kind === "worktree_remove")) {
+    const r = git(i.repo!, "worktree", "remove", i.path);
+    if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim() });
+  }
+  for (const i of selected.filter((i) => i.kind === "worktree_prune")) {
+    const r = git(i.repo!, "worktree", "prune");
+    if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim() });
+  }
+
+  const after = freeSpace()?.free_bytes ?? 0;
+  const result = { proposal: id, tier, mode: "applied", applied: selected.length - failures.length, plannedBytes: sum(selected), freedBytes: after - before, dropped, failures };
+  history(result);
+  if (tier === "approve") rmSync(join(STATE, "inbox", `${id}.json`), { force: true });
+  out(result);
+  if (failures.length > 0) process.exitCode = 1;
+}
+
+function check() {
+  const policy = loadPolicy();
+  const p = scan();
+  const auto = p.items.filter((i) => i.tier === "auto");
+  const approve = p.items.filter((i) => i.tier === "approve");
+  if (auto.length > 0) {
+    if (policy.auto.enabled) apply(p.id, "auto");
+    else history({ proposal: p.id, tier: "auto", mode: "shadow", items: auto.length, plannedBytes: sum(auto) });
+  }
+
+  const inbox = join(STATE, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const signature = approve.map(key).sort().join("\n");
+  const pending = readdirSync(inbox).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(inbox, f), "utf8")) as Proposal & { signature: string });
+  const unchanged = pending.find((q) => q.signature === signature && Date.parse(q.expiresAt) > Date.now());
+  const worthIt = approve.length > 0 && (sum(approve) >= policy.inbox.minBytes || (p.free?.state ?? "ok") !== "ok");
+  let inboxState = "none";
+  if (unchanged) inboxState = `unchanged ${unchanged.id}`;
+  else {
+    pending.forEach((q) => rmSync(join(inbox, `${q.id}.json`), { force: true }));
+    if (worthIt) {
+      writeFileSync(join(inbox, `${p.id}.json`), JSON.stringify({ ...p, signature }, null, 2));
+      inboxState = `new ${p.id}`;
+    }
+  }
+  const line = `${new Date().toISOString()} free=${p.free?.state ?? "?"}/${p.free?.free_percent?.toFixed(1) ?? "?"}% auto=${auto.length}(${policy.auto.enabled ? "applied" : "shadow"}) approve=${approve.length}/${(sum(approve) / 2 ** 30).toFixed(2)}GiB inbox=${inboxState}${p.errors.length ? ` errors=${p.errors.join("; ")}` : ""}\n`;
+  appendFileSync(join(STATE, "sweepy.log"), line);
+  out({ proposal: p.id, auto: auto.length, approve: approve.length, inbox: inboxState, errors: p.errors });
+}
+
+function status() {
+  const inbox = join(STATE, "inbox");
+  const pending = existsSync(inbox) ? readdirSync(inbox).filter((f) => f.endsWith(".json")).map((f) => {
+    const q: Proposal = JSON.parse(readFileSync(join(inbox, f), "utf8"));
+    const approve = q.items.filter((i) => i.tier === "approve");
+    return { id: q.id, expiresAt: q.expiresAt, items: approve.length, bytes: sum(approve) };
+  }) : [];
+  const log = existsSync(join(STATE, "sweepy.log")) ? readFileSync(join(STATE, "sweepy.log"), "utf8").trim().split("\n").at(-1) : null;
+  out({ free: freeSpace(), autoEnabled: loadPolicy().auto.enabled, pending, lastCheck: log, installed: existsSync(PLIST) });
+}
+
+function install() {
+  mkdirSync(STATE, { recursive: true });
+  mkdirSync(dirname(PLIST), { recursive: true });
+  const interval = Number(process.env.SWEEPY_INTERVAL ?? 3600);
+  writeFileSync(PLIST, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array><string>$SELF</string><string>check</string></array>
-  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array><string>${process.execPath}</string><string>${import.meta.path}</string><string>check</string></array>
+  <key>StartInterval</key><integer>${interval}</integer>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$STATE_DIR/launchd.log</string>
-  <key>StandardErrorPath</key><string>$STATE_DIR/launchd.log</string>
+  <key>StandardOutPath</key><string>${join(STATE, "launchd.log")}</string>
+  <key>StandardErrorPath</key><string>${join(STATE, "launchd.log")}</string>
 </dict>
 </plist>
-EOF
-  plutil -lint "$PLIST" >/dev/null
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  echo "installed $LABEL (every ${INTERVAL}s) -> $PLIST"
+`);
+  const uid = String(process.getuid!());
+  run(["launchctl", "bootout", `gui/${uid}/${LABEL}`]);
+  const r = run(["launchctl", "bootstrap", `gui/${uid}`, PLIST]);
+  if (r.code !== 0) return fail(`launchctl bootstrap failed: ${r.err.trim()}`);
+  out({ installed: LABEL, intervalSeconds: interval, plist: PLIST });
 }
 
-uninstall() {
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  rm -f "$PLIST"
-  echo "removed $LABEL (state kept in $STATE_DIR)"
+function uninstall() {
+  run(["launchctl", "bootout", `gui/${process.getuid!()}/${LABEL}`]);
+  rmSync(PLIST, { force: true });
+  out({ removed: LABEL, stateKept: STATE });
 }
 
-case "${1:-}" in
-  check) check ;;
-  install) install ;;
-  uninstall) uninstall ;;
-  *) echo "usage: sweepy check|install|uninstall" >&2; exit 2 ;;
-esac
+function out(v: unknown) { console.log(JSON.stringify(v, null, 2)); }
+function fail(msg: string) { console.error(JSON.stringify({ error: msg })); process.exitCode = 1; }
+
+const [cmd, arg, ...rest] = process.argv.slice(2);
+const tierFlag = [arg, ...rest].includes("--tier") ? ([arg, ...rest][[arg, ...rest].indexOf("--tier") + 1] as Tier) : "approve";
+switch (cmd) {
+  case "scan": out(scan()); break;
+  case "apply": if (!arg || arg.startsWith("--")) fail("usage: sweepy apply <proposal-id> [--tier approve|auto]"); else apply(arg, tierFlag); break;
+  case "check": check(); break;
+  case "status": status(); break;
+  case "install": install(); break;
+  case "uninstall": uninstall(); break;
+  default: fail("usage: sweepy scan | apply <id> [--tier approve|auto] | check | status | install | uninstall"); process.exitCode = 2;
+}

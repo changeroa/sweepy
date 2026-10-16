@@ -1,0 +1,25 @@
+{
+  "roots": ["~/projects"],
+  "protect": [
+    "~/.hent-ai",
+    "~/deploy",
+    "~/services",
+    "~/gisul",
+    "~/projects/openclaw-runtime"
+  ],
+  "artifacts": {
+    "kinds": ["node_modules", "target_dir", "framework_build_cache", "pycache_dir"],
+    "ecosystems": ["node", "rust", "python"],
+    "staleDays": 14
+  },
+  "worktrees": {
+    "idleDays": 7
+  },
+  "auto": {
+    "enabled": false
+  },
+  "inbox": {
+    "minBytes": 1073741824
+  },
+  "proposalTtlHours": 24
+}

@@ -1,57 +1,68 @@
 # sweepy
 
-맥미니 개발 디스크를 주기적으로 확인하고, 부족하면 정리 후보 보고서를 남기는 작은 cron 프로그램. 정리 엔진은 [Void](https://github.com/eladbash/void), 스케줄은 macOS launchd가 맡는다. sweepy는 아무것도 지우지 않는다. 지우는 일은 보고서를 본 사람이나 에이전트가 `void apply`로 한다.
+개발 디스크에서 두 가지만 치운다: **빌드 산출물**(`node_modules`, `target`, `.next`, `__pycache__`)과 **git 워크트리**. 무엇을 지워도 되는지는 정책 파일이 정하고, sweepy는 제안을 만들고 승인된 것만 적용한다. 탐지·삭제는 [Void](https://github.com/eladbash/void)와 git이 하고, 사람과의 대화는 sweepy 밖(에이전트 세션)이 한다.
 
 ```
 launchd (1시간마다) ─▶ sweepy check
-                        ├─ void guard check            ok면 기록만 하고 끝
-                        ├─ low/critical/확인 실패이고, 상태가 바뀌었거나 24시간 지났으면
-                        │    └─ void plan (dry-run, 2분 제한) ─▶ reports/<시각>.json
-                        └─ sweepy.log 에 한 줄 기록
+                        ├─ scan: 워크트리(git) + 산출물(Void, 정책 범위로 한정) ─▶ 제안 {id, items[tier], excluded[reason]}
+                        ├─ auto 등급: policy.auto.enabled면 적용, 아니면 history에 "shadow"로 기록만
+                        └─ approve 등급: 1 GiB 이상이거나 디스크가 부족하면 inbox/<id>.json 에 제안 (같은 내용이면 새로 만들지 않음)
+
+에이전트(메신저 세션) ─ inbox/ 감시 ─▶ 사람에게 요약 ─"승인"─▶ sweepy apply <id>
 ```
 
-보고서를 어디로 보낼지(Discord, 에이전트 등)는 어댑터의 몫이고, 지금은 어댑터가 없다. 보고서 파일과 로그가 출력의 전부다.
+## 등급
+
+| 등급 | 대상 | 이유 |
+|---|---|---|
+| auto | 디렉터리가 사라진 워크트리 기록(`git worktree prune`), 유휴 워크트리 **안의** 빌드 산출물 | 코드와 브랜치는 그대로, 다시 만들 수 있는 것만 |
+| approve | `staleDays` 이상 손대지 않은 산출물, 깨끗하고 모든 커밋이 원격에 있고 유휴인 워크트리 제거 | 재설치 시간이 들거나 작업 공간 자체라서 |
+| excluded | 커밋 안 된 변경·원격에 없는 커밋·잠긴 워크트리, `protect` 경로, 실행 중인 프로세스가 쓰는 프로젝트, `roots` 밖 | 복구할 수 없어서 |
+
+`apply`는 제안을 그대로 믿지 않는다. 다시 스캔해서 여전히 같은 등급인 항목만 적용하고, 나머지는 `dropped`로 돌려준다. 산출물은 Void 계획을 해당 경로로만 만들어 계획에 승인되지 않은 경로가 섞이면 중단하고, 워크트리는 `git worktree remove`(`--force` 없음)로 지운다. 회수량은 적용 전후 여유 공간을 실제로 재서 기록한다.
 
 ## 사용
 
 ```sh
-bin/sweepy check       # 한 번 실행. 보고서를 만들면 그 경로를 출력
-bin/sweepy install     # launchd 등록(dev.sweepy.check), 등록 즉시 1회 실행
-bin/sweepy uninstall   # launchd 해제. 상태·보고서는 남긴다
-sh scripts/doctor.sh   # 설치·디스크·스케줄·macOS 권한 대화상자 점검
+bin/sweepy scan                    # 제안 생성(아무것도 지우지 않음)
+bin/sweepy apply <id>              # approve 등급 적용
+bin/sweepy apply <id> --tier auto  # auto 등급 적용
+bin/sweepy check                   # launchd가 부르는 것: scan + auto(또는 shadow) + inbox
+bin/sweepy status                  # 여유 공간, 대기 중인 제안, 마지막 실행
+bin/sweepy install | uninstall     # launchd(dev.sweepy.check) 등록/해제
+sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대화상자 점검
 ```
 
-`install`은 이 체크아웃의 `bin/sweepy` 절대 경로를 등록하므로, 리포를 옮기면 다시 `install`한다.
+출력은 모두 JSON이다. 상태는 `~/.local/state/sweepy/`에 남는다: `proposals/`, `inbox/`, `history.jsonl`, `sweepy.log`.
 
-| 환경 변수 | 기본값 | 뜻 |
-|---|---|---|
-| `SWEEPY_VOID` | `~/.local/bin/void` | Void 실행 파일 |
-| `SWEEPY_STATE_DIR` | `~/.local/state/sweepy` | 로그·보고서·마지막 상태 |
-| `SWEEPY_INTERVAL` | `3600` | 확인 주기(초), `install` 때 적용 |
-| `SWEEPY_REPEAT_AFTER` | `86400` | 같은 상태를 다시 보고하기까지(초) |
-| `SWEEPY_SCAN_TIMEOUT` | `120` | `void plan` 제한 시간(초) |
-| `SWEEPY_VOID_CONFIG` | `void/sweepy.json` | sweepy가 Void에 넘기는 전용 설정 |
+## 정책 (`policy.json`)
 
-`void/sweepy.json`은 스캔을 `~/projects`와 node·rust·python으로 좁힌다. launchd에서 실행된 void는 macOS 권한을 자기 이름으로 묻기 때문에, 홈 전체를 스캔하면 다운로드·데스크탑·사진 폴더 권한 대화상자가 떠서 멈춘다(실측 4건). 범위를 좁힌 뒤로는 0건, 8초에 끝난다. 전역 Void 설정(`~/Library/Application Support/com.void.app/config.json`, Claude Code·Codex가 쓰는 것)은 건드리지 않는다.
+| 키 | 뜻 |
+|---|---|
+| `roots` | 스캔할 곳. 이 밖은 보지 않는다 |
+| `protect` | 절대 건드리지 않을 경로(배포 릴리스 등) |
+| `artifacts.kinds` / `ecosystems` / `staleDays` | 산출물 종류, Void 생태계, approve 기준 일수 |
+| `worktrees.idleDays` | 워크트리를 유휴로 보는 기준(마지막 커밋과 index 갱신 중 늦은 쪽) |
+| `auto.enabled` | `false`면 auto 등급을 기록만 한다. history의 shadow 기록을 보고 오판이 없으면 켠다 |
+| `inbox.minBytes` | 이 이상 모일 때만 inbox에 제안 |
+| `proposalTtlHours` | 제안 유효 시간 |
 
-보고서 형식: `{"state": "low", "guard": <void guard check>, "plan": <void plan>}`. 계획을 못 만들면 `"plan": null`과 `"plan_error"`가 들어간다(제한 시간 초과 시 최근 macOS 권한 대화상자 수 포함).
+환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_INTERVAL`(초, install 때).
 
 ## 설치
 
-1. Void CLI: [릴리스](https://github.com/eladbash/void/releases)의 `void-<버전>-aarch64-apple-darwin`을 `~/.local/bin/void`로 받고 sha256을 확인한다.
-2. 전역 보호 경로(에이전트가 직접 Void를 쓸 때): `cp void/config.json ~/Library/Application\ Support/com.void.app/config.json`
-3. 스케줄: `bin/sweepy install`
-4. 점검: `sh scripts/doctor.sh` (모두 OK면 종료 코드 0)
+1. Void CLI: [릴리스](https://github.com/eladbash/void/releases)의 `void-<버전>-aarch64-apple-darwin`을 `~/.local/bin/void`로 받고 sha256을 확인한다. Bun이 필요하다.
+2. `bin/sweepy install` (등록 즉시 1회 실행). 리포를 옮기면 다시 `install`.
+3. `sh scripts/doctor.sh`
 
-Claude Code·Codex에서 Void를 직접 쓰려면 `claude mcp add --scope user void -- ~/.local/bin/void mcp`, `codex mcp add void -- ~/.local/bin/void mcp`.
+에이전트가 Void를 직접 쓸 때의 전역 보호 경로는 `void/config.json`을 `~/Library/Application Support/com.void.app/config.json`으로 복사한다. sweepy 자신은 정책에서 만든 전용 설정만 쓴다.
 
 ## 운영하면서 알게 된 것
 
-- **macOS 권한 대화상자가 스캔을 멈춘다.** void가 다른 앱 데이터 폴더에 닿으면 macOS가 권한을 묻고, 응답 전까지 스캔이 멈춘다. sweepy는 2분 뒤 끊고 보고서에 대화상자 수를 적는다. 캐시 정리에는 "허용 안 함"이면 충분하다.
-- **`blocked_paths`는 계획에 그대로 나온다.** Void는 막힌 경로를 plan에서 빼지 않고 apply에서만 거부한다(상위 폴더를 막으면 하위도 막힘).
-- **Docker는 Colima 안에 있다.** `docker builder prune` 뒤에 `colima ssh -- sudo fstrim -av`를 해야 맥 여유 공간이 늘어난다(실측 +9.3 GiB).
-- **보고된 회수량과 실제 증가량은 다르다.** pnpm·Bun은 APFS 복제로 블록을 공유해서, `pnpm store prune`이 3 GB를 지웠다고 해도 실제로는 0.3 GiB만 늘었다.
-- **macOS에는 `timeout`이 없다.** `perl -e 'alarm shift; exec @ARGV or die' 120 <명령>`을 쓴다. `or die`가 없으면 실행 파일을 못 찾아도 perl이 0으로 끝난다.
+- **스캔 범위를 좁혀야 macOS 권한 대화상자가 안 뜬다.** launchd에서 실행된 void는 권한을 자기 이름으로 물어서, 홈 전체를 스캔하면 다운로드·데스크톱·사진 폴더 대화상자가 떠서 멈춘다(실측 4건). sweepy는 `roots`만 스캔해서 0건, 약 10초에 끝난다. 그래서 워크트리도 Void 대신 git으로 직접 찾는다.
+- **Void의 `blocked_paths`는 계획에 그대로 나온다.** apply에서만 거부되므로 sweepy가 `protect`로 먼저 거른다.
+- **보고된 회수량과 실제 증가량은 다르다.** pnpm·Bun은 APFS 복제로 블록을 공유한다. sweepy는 실측값만 기록한다.
+- **Docker는 Colima 안에 있다.** 범위 밖이지만, `docker builder prune` 뒤에 `colima ssh -- sudo fstrim -av`를 해야 공간이 돌아온다.
 
 ## 제거
 
