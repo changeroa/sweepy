@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
 
@@ -83,6 +83,16 @@ function findRepos(roots: string[]): string[] {
 }
 
 type Worktree = { path: string; repo: string; idleDays: number; locked: boolean };
+const canonical = (p: string) => { try { return realpathSync.native(p).toLowerCase(); } catch { return p.toLowerCase(); } };
+
+function sharedWithActiveWorktree(artifact: string, worktrees: Worktree[], idleDays: number): Worktree | undefined {
+  const target = canonical(artifact);
+  return worktrees.find((w) => {
+    if (w.idleDays >= idleDays || !under(artifact, w.repo)) return false;
+    const mirror = join(w.path, artifact.slice(w.repo.length));
+    try { return lstatSync(mirror).isSymbolicLink() && canonical(mirror) === target; } catch { return false; }
+  });
+}
 
 function scanWorktrees(policy: Policy, inUse: string[], items: Item[], excluded: Excluded[]): Worktree[] {
   const found: Worktree[] = [];
@@ -139,6 +149,8 @@ function scanArtifacts(policy: Policy, worktrees: Worktree[], inUse: string[], i
     if (underAny(a.path, policy.protect)) { exclude("protected path"); continue; }
     const project = repoRoot(a.path);
     if (inUse.some((c) => under(c, project))) { exclude("project in use by a running process"); continue; }
+    const sharer = sharedWithActiveWorktree(a.path, worktrees, policy.worktrees.idleDays);
+    if (sharer) { exclude(`shared via symlink with active worktree ${sharer.path}`); continue; }
     const base = { kind: "artifact" as const, path: a.path, bytes: a.size_bytes ?? 0, artifactKind: a.kind };
     const wt = worktrees.find((w) => under(a.path, w.path));
     if (wt) {
@@ -187,20 +199,29 @@ function apply(id: string, tier: Tier) {
   const failures: { path: string; error: string }[] = [];
   const before = freeSpace()?.free_bytes ?? 0;
 
-  const artifacts = selected.filter((i) => i.kind === "artifact");
+  let artifacts = selected.filter((i) => i.kind === "artifact");
   if (artifacts.length > 0) {
     const policy = loadPolicy();
-    const args = [VOID, "--json", "--config", voidConfig(policy), "plan", "--max-risk", "safe"];
-    for (const k of new Set(artifacts.map((a) => a.artifactKind!))) args.push("-k", k);
-    for (const a of artifacts) args.push("-p", a.path);
-    const plan = run(args, { timeoutMs: SCAN_TIMEOUT_MS });
-    let parsed: any = null;
-    try { parsed = JSON.parse(plan.out); } catch {}
-    const allowed = new Set(artifacts.map((a) => a.path));
-    const extra = parsed?.entries?.filter((e: any) => !allowed.has(e.path)) ?? [];
-    if (!parsed) artifacts.forEach((a) => failures.push({ path: a.path, error: "void plan failed" }));
-    else if (extra.length > 0) artifacts.forEach((a) => failures.push({ path: a.path, error: `void plan included unapproved paths: ${extra.map((e: any) => e.path).join(", ")}` }));
-    else {
+    const makePlan = () => {
+      const args = [VOID, "--json", "--config", voidConfig(policy), "plan", "--max-risk", "safe"];
+      for (const k of new Set(artifacts.map((a) => a.artifactKind!))) args.push("-k", k);
+      for (const a of artifacts) args.push("-p", a.path);
+      let parsed: any = null;
+      try { parsed = JSON.parse(run(args, { timeoutMs: SCAN_TIMEOUT_MS }).out); } catch {}
+      const allowed = new Set(artifacts.map((a) => a.path));
+      return { parsed, extra: (parsed?.entries ?? []).filter((e: any) => !allowed.has(e.path)) as any[] };
+    };
+    let { parsed, extra } = makePlan();
+    if (parsed && extra.length > 0) {
+      const aliased = new Set(extra.map((e) => canonical(e.path)));
+      const shared = artifacts.filter((a) => aliased.has(canonical(a.path)));
+      shared.forEach((a) => dropped.push({ path: a.path, kind: "artifact", reason: `same directory is also reachable as ${extra.find((e) => canonical(e.path) === canonical(a.path))?.path}` }));
+      artifacts = artifacts.filter((a) => !shared.includes(a));
+      ({ parsed, extra } = artifacts.length > 0 ? makePlan() : { parsed: { entries: [] }, extra: [] });
+    }
+    if (artifacts.length > 0 && !parsed) artifacts.forEach((a) => failures.push({ path: a.path, error: "void plan failed" }));
+    else if (artifacts.length > 0 && extra.length > 0) artifacts.forEach((a) => failures.push({ path: a.path, error: `void plan included unapproved paths: ${extra.map((e: any) => e.path).join(", ")}` }));
+    else if (artifacts.length > 0) {
       const res = run([VOID, "--json", "--config", voidConfig(policy), "apply", "--yes", parsed.plan_id], { timeoutMs: 600_000 });
       try { JSON.parse(res.out).failed.forEach((f: any) => failures.push({ path: f.path, error: f.error })); }
       catch { failures.push({ path: "(void apply)", error: res.err.slice(-300) || `exit ${res.code}` }); }
