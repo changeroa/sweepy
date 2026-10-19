@@ -16,8 +16,14 @@ const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
 
 type Tier = "auto" | "approve";
-type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner";
-type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean };
+type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir";
+type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean; files?: string[] };
+// archives: compress (zstd --rm, never delete) files matching `match` under `paths` untouched for olderThanDays and not open.
+type Archive = { id: string; paths: string[]; match: string; olderThanDays: number; tier: Tier };
+// staleDirs: children of `parent` other than the kept ones (target of `keep.symlink`, basename of `keep.cmd` output,
+// the `keepNewest` most recently modified), optionally only those untouched for olderThanDays.
+type StaleDirs = { id: string; parent: string; keep?: { symlink?: string; cmd?: string[] }; keepNewest?: number; olderThanDays?: number; tier: Tier };
+const ZSTD_RATIO = 0.15; // jsonl session logs compress to roughly this fraction; the estimate is size * (1 - ratio)
 // A cleaner wraps a tool's own prune command. size: `cmd` output (optionally via `pattern` capture group),
 // or du over `du` paths, or du over the path printed by `duOf`. `shadow` cleaners are only recorded, never run by auto.
 // `sum` adds up every non-empty output line; `si` reads kB/MB/GB as powers of 1000 (Docker's convention).
@@ -38,6 +44,8 @@ type Policy = {
   inbox: { minBytes: number }; proposalTtlHours: number;
   report?: { paths?: string[]; childrenOf?: string[]; top?: number };
   cleaners?: Cleaner[];
+  archives?: Archive[];
+  staleDirs?: StaleDirs[];
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -237,6 +245,66 @@ function scanCleaners(policy: Policy, items: Item[], excluded: Excluded[]) {
   }
 }
 
+function openFiles(files: string[]): Set<string> {
+  const open = new Set<string>();
+  for (let i = 0; i < files.length; i += 200) {
+    run(["lsof", "-Fn", "--", ...files.slice(i, i + 200)]).out.split("\n").filter((l) => l.startsWith("n/")).forEach((l) => open.add(l.slice(1)));
+  }
+  return open;
+}
+function archiveCandidates(a: Archive): { files: string[]; bytes: number; open: number } {
+  const re = new RegExp(a.match), cutoff = Date.now() - a.olderThanDays * DAY, found: { p: string; size: number }[] = [];
+  const walk = (dir: string) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory() && !e.isSymbolicLink()) walk(p);
+      else if (e.isFile() && re.test(e.name)) { const st = statSync(p); if (st.mtimeMs < cutoff) found.push({ p, size: st.size }); }
+    }
+  };
+  a.paths.map(real).forEach(walk);
+  const open = openFiles(found.map((f) => f.p));
+  const closed = found.filter((f) => !open.has(f.p));
+  return { files: closed.map((f) => f.p), bytes: closed.reduce((n, f) => n + f.size, 0), open: found.length - closed.length };
+}
+function staleDirCandidates(s: StaleDirs): string[] {
+  const parent = real(s.parent);
+  let dirs: { p: string; mtime: number }[];
+  try { dirs = readdirSync(parent, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => ({ p: join(parent, e.name), mtime: statSync(join(parent, e.name)).mtimeMs })); } catch { return []; }
+  const keep = new Set<string>();
+  if (s.keep?.symlink) { try { keep.add(realpathSync(real(s.keep.symlink))); } catch {} }
+  if (s.keep?.cmd) {
+    if (Bun.which(s.keep.cmd[0]) == null) return []; // cannot tell what is current: keep everything
+    const r = run(s.keep.cmd, { timeoutMs: 30_000 });
+    const name = r.out.trim().split("/").filter(Boolean).at(-1);
+    if (r.code !== 0 || !name) return [];
+    keep.add(join(parent, name));
+  }
+  if ((s.keep?.symlink || s.keep?.cmd) && keep.size === 0) return [];
+  dirs.sort((a, b) => b.mtime - a.mtime).slice(0, s.keepNewest ?? 0).forEach((d) => keep.add(d.p));
+  const cutoff = Date.now() - (s.olderThanDays ?? 0) * DAY;
+  return dirs.filter((d) => !keep.has(d.p) && ![...keep].some((k) => canonical(k) === canonical(d.p)) && d.mtime < cutoff).map((d) => d.p);
+}
+function scanHousekeeping(policy: Policy, inUse: string[], items: Item[], excluded: Excluded[]) {
+  const zstd = Bun.which("zstd") != null;
+  for (const a of policy.archives ?? []) {
+    if (!zstd) { excluded.push({ kind: "archive", path: a.id, reason: "zstd not installed" }); continue; }
+    const c = archiveCandidates(a);
+    if (c.open > 0) excluded.push({ kind: "archive", path: a.id, reason: `${c.open} old file(s) still open` });
+    if (c.files.length === 0) continue;
+    items.push({ tier: a.tier, kind: "archive", path: a.id, files: c.files, bytes: Math.round(c.bytes * (1 - ZSTD_RATIO)),
+      reason: `zstd-compress ${c.files.length} file(s) older than ${a.olderThanDays}d (${(c.bytes / 2 ** 30).toFixed(2)} GiB raw)` });
+  }
+  for (const s of policy.staleDirs ?? []) {
+    for (const p of staleDirCandidates(s)) {
+      if (underAny(p, policy.protect)) { excluded.push({ kind: "stale_dir", path: p, reason: "protected path" }); continue; }
+      if (inUse.some((c) => under(c, p))) { excluded.push({ kind: "stale_dir", path: p, reason: "in use by a running process" }); continue; }
+      items.push({ tier: s.tier, kind: "stale_dir", path: p, repo: s.id, bytes: duBytes(p), reason: `${s.id}: not the current version` });
+    }
+  }
+}
+
 function scan(): Proposal {
   const policy = loadPolicy();
   const items: Item[] = [], excluded: Excluded[] = [], errors: string[] = [];
@@ -244,6 +312,7 @@ function scan(): Proposal {
   const worktrees = scanWorktrees(policy, inUse, items, excluded);
   scanArtifacts(policy, worktrees, inUse, items, excluded, errors);
   scanCleaners(policy, items, excluded);
+  scanHousekeeping(policy, inUse, items, excluded);
   const now = new Date();
   const proposal: Proposal = {
     version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
@@ -268,7 +337,8 @@ function apply(id: string, tier: Tier) {
   const proposal: Proposal = JSON.parse(readFileSync(path, "utf8"));
   if (Date.parse(proposal.expiresAt) < Date.now()) return fail(`proposal ${id} expired at ${proposal.expiresAt}`);
 
-  const fresh = new Set(scan().items.filter((i) => i.tier === tier).map(key));
+  const freshItems = new Map(scan().items.filter((i) => i.tier === tier).map((i) => [key(i), i]));
+  const fresh = new Set(freshItems.keys());
   const tierItems = proposal.items.filter((i) => i.tier === tier);
   const wanted = tier === "auto" ? tierItems.filter((i) => !i.shadow) : tierItems;
   const selected = wanted.filter((i) => fresh.has(key(i)));
@@ -324,6 +394,19 @@ function apply(id: string, tier: Tier) {
       if (r.code !== 0) { failures.push({ path: i.path, error: `${argv.join(" ")}: ${r.err.trim().split("\n").at(-1) || `exit ${r.code}`}` }); break; }
     }
     cleaners.push({ cleaner: c.id, estimated: i.bytes, measured: (diskUsage()?.avail_bytes ?? 0) - b });
+  }
+
+  for (const i of selected.filter((i) => i.kind === "archive")) {
+    // Only files that were approved AND are still old and closed right now.
+    const still = new Set(freshItems.get(key(i))?.files ?? []);
+    for (const f of (i.files ?? []).filter((f) => still.has(f))) {
+      if (existsSync(f + ".zst")) { failures.push({ path: f, error: "archive .zst already exists" }); continue; }
+      const r = run(["zstd", "-q", "--rm", f], { timeoutMs: 120_000 });
+      if (r.code !== 0) failures.push({ path: f, error: r.err.trim() || `zstd exit ${r.code}` });
+    }
+  }
+  for (const i of selected.filter((i) => i.kind === "stale_dir")) {
+    try { rmSync(i.path, { recursive: true }); } catch (e) { failures.push({ path: i.path, error: String(e) }); }
   }
 
   const after = freeSpace()?.free_bytes ?? 0;
