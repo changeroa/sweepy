@@ -20,8 +20,11 @@ type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner";
 type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean };
 // A cleaner wraps a tool's own prune command. size: `cmd` output (optionally via `pattern` capture group),
 // or du over `du` paths, or du over the path printed by `duOf`. `shadow` cleaners are only recorded, never run by auto.
-type SizeSpec = { cmd?: string[]; pattern?: string; du?: string[]; duOf?: string[] };
-type Cleaner = { id: string; tier: Tier; detect: string[]; size: SizeSpec; dryRun?: string[]; apply: string[]; shadow?: boolean; enabled?: boolean };
+// `sum` adds up every non-empty output line; `si` reads kB/MB/GB as powers of 1000 (Docker's convention).
+// `apply` is one argv or a list of argvs run in order, stopping at the first failure.
+type SizeSpec = { cmd?: string[]; pattern?: string; sum?: boolean; si?: boolean; du?: string[]; duOf?: string[] };
+type Cleaner = { id: string; tier: Tier; detect: string[]; size: SizeSpec; dryRun?: string[]; apply: string[] | string[][]; shadow?: boolean; enabled?: boolean };
+const steps = (c: Cleaner): string[][] => (Array.isArray(c.apply[0]) ? (c.apply as string[][]) : [c.apply as string[]]);
 type Excluded = { kind: Kind; path: string; reason: string };
 type Free = { state: string; free_bytes: number; free_percent: number } | null;
 type Proposal = {
@@ -195,20 +198,26 @@ function scanArtifacts(policy: Policy, worktrees: Worktree[], inUse: string[], i
 }
 
 const UNITS: Record<string, number> = { "": 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 };
-function parseBytes(s: string): number | null {
+function parseBytes(s: string, si = false): number | null {
   const m = s.match(/([\d.]+)\s*([KMGT]?)i?B?\b/i);
-  return m ? Math.round(Number(m[1]) * UNITS[m[2].toUpperCase()]) : null;
+  if (!m) return null;
+  const u = m[2].toUpperCase();
+  return Math.round(Number(m[1]) * (si ? 1000 ** "_KMGT".indexOf(u || "_") : UNITS[u]));
 }
-const installed = (argv: string[]) => Bun.which(argv[0]) != null && run(argv, { timeoutMs: 30_000 }).code === 0;
+function detect(argv: string[]): string | null {
+  if (Bun.which(argv[0]) == null) return "tool not installed";
+  return run(argv, { timeoutMs: 30_000 }).code === 0 ? null : `${argv.join(" ")} failed`;
+}
 
 function cleanerSize(c: Cleaner): number | null {
   const s = c.size;
   if (s.cmd) {
     const r = run(s.cmd, { timeoutMs: SCAN_TIMEOUT_MS });
     if (r.code !== 0) return null;
-    if (!s.pattern) return parseBytes(r.out.trim());
+    if (s.sum) return r.out.split("\n").map((l) => (l.trim() ? parseBytes(l, s.si) ?? 0 : 0)).reduce((a, b) => a + b, 0);
+    if (!s.pattern) return parseBytes(r.out.trim(), s.si);
     const hit = (r.out + r.err).match(new RegExp(s.pattern));
-    return hit ? parseBytes(hit[1]) : 0;
+    return hit ? parseBytes(hit[1], s.si) : 0;
   }
   const paths = s.du ?? (s.duOf ? [run(s.duOf, { timeoutMs: 30_000 }).out.trim()] : []);
   return paths.filter(Boolean).map(real).filter((p) => existsSync(p)).reduce((n, p) => n + duBytes(p), 0);
@@ -218,12 +227,13 @@ function scanCleaners(policy: Policy, items: Item[], excluded: Excluded[]) {
   for (const c of policy.cleaners ?? []) {
     if (c.enabled === false) continue;
     const exclude = (reason: string) => excluded.push({ kind: "cleaner", path: c.id, reason });
-    if (!installed(c.detect)) { exclude("tool not installed"); continue; }
+    const missing = detect(c.detect);
+    if (missing) { exclude(missing); continue; }
     const bytes = cleanerSize(c);
     if (bytes == null) { exclude("size query failed"); continue; }
     if (bytes === 0) { exclude("nothing to reclaim"); continue; }
     items.push({ tier: c.tier, kind: "cleaner", path: c.id, bytes, shadow: c.shadow === true,
-      reason: `${c.apply.join(" ")} (estimate from ${c.size.cmd ? c.size.cmd.join(" ") : "du"})${c.shadow ? ", shadow" : ""}` });
+      reason: `${steps(c).map((a) => a.join(" ")).join(" && ")} (estimate from ${c.size.cmd ? c.size.cmd.join(" ") : "du"})${c.shadow ? ", shadow" : ""}` });
   }
 }
 
@@ -309,9 +319,11 @@ function apply(id: string, tier: Tier) {
     const c = loadPolicy().cleaners?.find((x) => x.id === i.path);
     if (!c) { failures.push({ path: i.path, error: "cleaner no longer in policy" }); continue; }
     const b = diskUsage()?.avail_bytes ?? 0;
-    const r = run(c.apply, { timeoutMs: 600_000 });
+    for (const argv of steps(c)) {
+      const r = run(argv, { timeoutMs: 600_000 });
+      if (r.code !== 0) { failures.push({ path: i.path, error: `${argv.join(" ")}: ${r.err.trim().split("\n").at(-1) || `exit ${r.code}`}` }); break; }
+    }
     cleaners.push({ cleaner: c.id, estimated: i.bytes, measured: (diskUsage()?.avail_bytes ?? 0) - b });
-    if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim().split("\n").at(-1) || `exit ${r.code}` });
   }
 
   const after = freeSpace()?.free_bytes ?? 0;
@@ -406,8 +418,9 @@ function report(json: boolean) {
 // Show what each cleaner would do, using its own dry-run command when it has one. Never runs `apply`.
 function dryRun(only?: string) {
   const results = (loadPolicy().cleaners ?? []).filter((c) => c.enabled !== false && (!only || c.id === only)).map((c) => {
-    if (!installed(c.detect)) return { id: c.id, installed: false };
-    const base = { id: c.id, installed: true, tier: c.tier, shadow: c.shadow === true, apply: c.apply.join(" "), estimatedBytes: cleanerSize(c) };
+    const missing = detect(c.detect);
+    if (missing) return { id: c.id, installed: false, reason: missing };
+    const base = { id: c.id, installed: true, tier: c.tier, shadow: c.shadow === true, apply: steps(c).map((a) => a.join(" ")), estimatedBytes: cleanerSize(c) };
     if (!c.dryRun) return base;
     const r = run(c.dryRun, { timeoutMs: SCAN_TIMEOUT_MS });
     return { ...base, dryRun: c.dryRun.join(" "), exit: r.code, output: (r.out + r.err).trim().split("\n").slice(-15) };
