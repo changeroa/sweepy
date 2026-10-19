@@ -266,7 +266,8 @@
       "keep": {
         "symlink": "/opt/homebrew/opt/{name}"
       },
-      "tier": "approve"
+      "tier": "approve",
+      "checkReferences": true
     }
   ],
   "clones": {
@@ -282,5 +283,9 @@
   },
   "brewDuplicates": {
     "tier": "approve"
-  }
+  },
+  "brew": {
+    "allowVersionedRemoval": false
+  },
+  "referenceRoots": []
 }
