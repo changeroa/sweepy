@@ -150,6 +150,52 @@
         "cache",
         "verify"
       ]
+    },
+    {
+      "id": "docker",
+      "tier": "approve",
+      "detect": [
+        "colima",
+        "status"
+      ],
+      "size": {
+        "cmd": [
+          "docker",
+          "system",
+          "df",
+          "--format",
+          "{{if or (eq .Type \"Images\") (eq .Type \"Build Cache\")}}{{.Reclaimable}}{{end}}"
+        ],
+        "sum": true,
+        "si": true
+      },
+      "dryRun": [
+        "docker",
+        "system",
+        "df"
+      ],
+      "apply": [
+        [
+          "docker",
+          "builder",
+          "prune",
+          "-f"
+        ],
+        [
+          "docker",
+          "image",
+          "prune",
+          "-f"
+        ],
+        [
+          "colima",
+          "ssh",
+          "--",
+          "sudo",
+          "fstrim",
+          "-av"
+        ]
+      ]
     }
   ]
 }

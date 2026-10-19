@@ -61,6 +61,8 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 
 기본 cleaner: brew(`brew cleanup --prune=30`), uv(`uv cache prune`), pnpm(`pnpm store prune`), npm(`npm cache verify`). 모두 auto + shadow로 시작한다.
 
+docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `docker system df`의 Images·Build Cache RECLAIMABLE 합(SI 단위). 적용은 `docker builder prune -f` → `docker image prune -f`(dangling만) → `colima ssh -- sudo fstrim -av` 순서로, 앞 단계가 실패하면 멈춘다. fstrim이 돌려주는 VM 디스크 여유분은 추정치에 들어가지 않고 measured에만 나타난다.
+
 테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 
 ## 설치
