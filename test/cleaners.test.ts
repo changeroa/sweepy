@@ -36,7 +36,7 @@ test("non-shadow auto cleaner runs its prune and records estimate vs measured", 
   await s.run(["check"]);
   expect(existsSync(marker)).toBe(true);
   const applied = history().find((h) => h.mode === "applied");
-  expect(applied.cleaners).toEqual([{ cleaner: "uv", estimated: 1024 * 1024, measured: expect.any(Number) }]);
+  expect(applied.measurements).toEqual([{ source: "uv", estimated: 1024 * 1024, measured: expect.any(Number) }]);
 }, 30_000);
 
 test("missing tool is excluded, and dry-run never runs apply", async () => {

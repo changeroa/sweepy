@@ -16,13 +16,17 @@ const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
 
 type Tier = "auto" | "approve";
-type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir" | "clone";
+type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir" | "clone" | "brew_dup";
 type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean; files?: string[]; ignored?: string[] };
 // archives: compress (zstd --rm, never delete) files matching `match` under `paths` untouched for olderThanDays and not open.
 type Archive = { id: string; paths: string[]; match: string; olderThanDays: number; tier: Tier };
 // staleDirs: children of `parent` other than the kept ones (target of `keep.symlink`, basename of `keep.cmd` output,
 // the `keepNewest` most recently modified), optionally only those untouched for olderThanDays.
-type StaleDirs = { id: string; parent: string; keep?: { symlink?: string; cmd?: string[] }; keepNewest?: number; olderThanDays?: number; tier: Tier };
+// `parent` ending in "/*" applies the rule to every child of that directory, with {name} in keep.symlink replaced by the
+// child's name. `match` whitelists child names; `lastAccessDays` uses the newest atime of any file inside;
+// `unlessRunning` skips the whole rule while a process with that exact name runs.
+type StaleDirs = { id: string; parent: string; keep?: { symlink?: string; cmd?: string[] }; keepNewest?: number; olderThanDays?: number;
+  match?: string; lastAccessDays?: number; unlessRunning?: string; tier: Tier };
 const ZSTD_RATIO = 0.15; // jsonl session logs compress to roughly this fraction; the estimate is size * (1 - ratio)
 // A cleaner wraps a tool's own prune command. size: `cmd` output (optionally via `pattern` capture group),
 // or du over `du` paths, or du over the path printed by `duOf`. `shadow` cleaners are only recorded, never run by auto.
@@ -47,6 +51,7 @@ type Policy = {
   archives?: Archive[];
   staleDirs?: StaleDirs[];
   clones?: { namePatterns: string[]; idleDays: number };
+  brewDuplicates?: { tier: Tier };
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -269,7 +274,29 @@ function archiveCandidates(a: Archive): { files: string[]; bytes: number; open: 
   const closed = found.filter((f) => !open.has(f.p));
   return { files: closed.map((f) => f.p), bytes: closed.reduce((n, f) => n + f.size, 0), open: found.length - closed.length };
 }
+function newestAtime(dir: string): number {
+  let newest = 0;
+  const walk = (d: string) => {
+    let entries;
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory() && !e.isSymbolicLink()) walk(p);
+      else { try { newest = Math.max(newest, lstatSync(p).atimeMs); } catch {} }
+    }
+  };
+  walk(dir);
+  return newest;
+}
 function staleDirCandidates(s: StaleDirs): string[] {
+  if (s.parent.endsWith("/*")) {
+    const base = real(s.parent.slice(0, -2));
+    let names: string[] = [];
+    try { names = readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => e.name); } catch {}
+    return names.flatMap((name) => staleDirCandidates({ ...s, parent: join(base, name),
+      keep: s.keep && { ...s.keep, symlink: s.keep.symlink?.replaceAll("{name}", name) } }));
+  }
+  if (s.unlessRunning && run(["pgrep", "-x", s.unlessRunning]).code === 0) return [];
   const parent = real(s.parent);
   let dirs: { p: string; mtime: number }[];
   try { dirs = readdirSync(parent, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => ({ p: join(parent, e.name), mtime: statSync(join(parent, e.name)).mtimeMs })); } catch { return []; }
@@ -285,7 +312,11 @@ function staleDirCandidates(s: StaleDirs): string[] {
   if ((s.keep?.symlink || s.keep?.cmd) && keep.size === 0) return [];
   dirs.sort((a, b) => b.mtime - a.mtime).slice(0, s.keepNewest ?? 0).forEach((d) => keep.add(d.p));
   const cutoff = Date.now() - (s.olderThanDays ?? 0) * DAY;
-  return dirs.filter((d) => !keep.has(d.p) && ![...keep].some((k) => canonical(k) === canonical(d.p)) && d.mtime < cutoff).map((d) => d.p);
+  const match = s.match ? new RegExp(s.match) : null;
+  return dirs.filter((d) => !keep.has(d.p) && ![...keep].some((k) => canonical(k) === canonical(d.p)) && d.mtime < cutoff)
+    .filter((d) => !match || match.test(d.p.split("/").at(-1)!))
+    .filter((d) => s.lastAccessDays == null || newestAtime(d.p) < Date.now() - s.lastAccessDays * DAY)
+    .map((d) => d.p);
 }
 function scanHousekeeping(policy: Policy, inUse: string[], items: Item[], excluded: Excluded[]) {
   const zstd = Bun.which("zstd") != null;
@@ -301,7 +332,29 @@ function scanHousekeeping(policy: Policy, inUse: string[], items: Item[], exclud
     for (const p of staleDirCandidates(s)) {
       if (underAny(p, policy.protect)) { excluded.push({ kind: "stale_dir", path: p, reason: "protected path" }); continue; }
       if (inUse.some((c) => under(c, p))) { excluded.push({ kind: "stale_dir", path: p, reason: "in use by a running process" }); continue; }
-      items.push({ tier: s.tier, kind: "stale_dir", path: p, repo: s.id, bytes: duBytes(p), reason: `${s.id}: not the current version` });
+      const why = s.lastAccessDays != null ? `not accessed for ${s.lastAccessDays}d` : s.keep || s.keepNewest ? "not the current version" : s.olderThanDays ? `untouched ${s.olderThanDays}d` : "whitelisted cache";
+      items.push({ tier: s.tier, kind: "stale_dir", path: p, repo: s.id, bytes: duBytes(p), reason: `${s.id}: ${why}` });
+    }
+  }
+}
+
+// Several installed versions of one versioned formula (node@22 + node@24): propose the older ones nothing depends on.
+function scanBrewDuplicates(policy: Policy, items: Item[], excluded: Excluded[]) {
+  if (!policy.brewDuplicates || Bun.which("brew") == null) return;
+  const names = run(["brew", "list", "--formula"], { timeoutMs: 60_000 }).out.split("\n").filter(Boolean);
+  const families = new Map<string, string[]>();
+  for (const n of names) { const base = n.split("@")[0]; families.set(base, [...(families.get(base) ?? []), n]); }
+  const ver = (n: string) => (n.includes("@") ? n.split("@")[1].split(".").map(Number) : [Infinity]);
+  const newer = (a: string, b: string) => { const [x, y] = [ver(a), ver(b)]; for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0); return false; };
+  const cellar = run(["brew", "--cellar"]).out.trim();
+  for (const [, members] of families) {
+    if (members.length < 2 || !members.some((m) => m.includes("@"))) continue;
+    const latest = members.reduce((a, b) => (newer(b, a) ? b : a));
+    for (const m of members.filter((x) => x !== latest)) {
+      const users = run(["brew", "uses", "--installed", m], { timeoutMs: 60_000 }).out.split("\n").filter(Boolean);
+      if (users.length > 0) { excluded.push({ kind: "brew_dup", path: m, reason: `needed by ${users.join(", ")}` }); continue; }
+      items.push({ tier: policy.brewDuplicates.tier === "auto" ? "approve" : policy.brewDuplicates.tier, kind: "brew_dup", path: m,
+        bytes: duBytes(join(cellar, m)), reason: `older than ${latest}, no installed dependents (brew uninstall ${m})` });
     }
   }
 }
@@ -374,6 +427,7 @@ function scan(): Proposal {
   scanCleaners(policy, items, excluded);
   scanHousekeeping(policy, inUse, items, excluded);
   scanClones(policy, inUse, items, excluded);
+  scanBrewDuplicates(policy, items, excluded);
   const now = new Date();
   const proposal: Proposal = {
     version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
@@ -445,33 +499,49 @@ function apply(id: string, tier: Tier) {
     if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim() });
   }
 
-  const cleaners: { cleaner: string; estimated: number; measured: number }[] = [];
+  // estimated vs measured (Data-volume free space delta) per source: cleaner id, archive id, staleDirs id, "clone", "brew_dup".
+  const measurements: { source: string; estimated: number; measured: number }[] = [];
+  const measure = (source: string, estimated: number, work: () => void) => {
+    const b = diskUsage()?.avail_bytes ?? 0;
+    work();
+    measurements.push({ source, estimated, measured: (diskUsage()?.avail_bytes ?? 0) - b });
+  };
   for (const i of selected.filter((i) => i.kind === "cleaner")) {
     const c = loadPolicy().cleaners?.find((x) => x.id === i.path);
     if (!c) { failures.push({ path: i.path, error: "cleaner no longer in policy" }); continue; }
-    const b = diskUsage()?.avail_bytes ?? 0;
-    for (const argv of steps(c)) {
-      const r = run(argv, { timeoutMs: 600_000 });
-      if (r.code !== 0) { failures.push({ path: i.path, error: `${argv.join(" ")}: ${r.err.trim().split("\n").at(-1) || `exit ${r.code}`}` }); break; }
-    }
-    cleaners.push({ cleaner: c.id, estimated: i.bytes, measured: (diskUsage()?.avail_bytes ?? 0) - b });
+    measure(c.id, i.bytes, () => {
+      for (const argv of steps(c)) {
+        const r = run(argv, { timeoutMs: 600_000 });
+        if (r.code !== 0) { failures.push({ path: i.path, error: `${argv.join(" ")}: ${r.err.trim().split("\n").at(-1) || `exit ${r.code}`}` }); break; }
+      }
+    });
   }
 
   for (const i of selected.filter((i) => i.kind === "archive")) {
     // Only files that were approved AND are still old and closed right now.
     const still = new Set(freshItems.get(key(i))?.files ?? []);
-    for (const f of (i.files ?? []).filter((f) => still.has(f))) {
-      if (existsSync(f + ".zst")) { failures.push({ path: f, error: "archive .zst already exists" }); continue; }
-      const r = run(["zstd", "-q", "--rm", f], { timeoutMs: 120_000 });
-      if (r.code !== 0) failures.push({ path: f, error: r.err.trim() || `zstd exit ${r.code}` });
-    }
+    measure(i.path, i.bytes, () => {
+      for (const f of (i.files ?? []).filter((f) => still.has(f))) {
+        if (existsSync(f + ".zst")) { failures.push({ path: f, error: "archive .zst already exists" }); continue; }
+        const r = run(["zstd", "-q", "--rm", f], { timeoutMs: 120_000 });
+        if (r.code !== 0) failures.push({ path: f, error: r.err.trim() || `zstd exit ${r.code}` });
+      }
+    });
   }
   for (const i of selected.filter((i) => i.kind === "stale_dir" || i.kind === "clone")) {
-    try { rmSync(i.path, { recursive: true }); } catch (e) { failures.push({ path: i.path, error: String(e) }); }
+    measure(i.kind === "clone" ? "clone" : i.repo ?? "stale_dir", i.bytes, () => {
+      try { rmSync(i.path, { recursive: true }); } catch (e) { failures.push({ path: i.path, error: String(e) }); }
+    });
+  }
+  for (const i of selected.filter((i) => i.kind === "brew_dup")) {
+    measure("brew_dup", i.bytes, () => {
+      const r = run(["brew", "uninstall", i.path], { timeoutMs: 600_000 });
+      if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim().split("\n").at(-1) || `exit ${r.code}` });
+    });
   }
 
   const after = freeSpace()?.free_bytes ?? 0;
-  const result = { proposal: id, tier, mode: "applied", applied: selected.length - failures.length, plannedBytes: sum(selected), freedBytes: after - before, cleaners, dropped, failures };
+  const result = { proposal: id, tier, mode: "applied", applied: selected.length - failures.length, plannedBytes: sum(selected), freedBytes: after - before, measurements, dropped, failures };
   history(result);
   if (tier === "approve") rmSync(join(STATE, "inbox", `${id}.json`), { force: true });
   out(result);
@@ -517,7 +587,28 @@ function status() {
     return { id: q.id, expiresAt: q.expiresAt, items: approve.length, bytes: sum(approve) };
   }) : [];
   const log = existsSync(join(STATE, "sweepy.log")) ? readFileSync(join(STATE, "sweepy.log"), "utf8").trim().split("\n").at(-1) : null;
-  out({ free: freeSpace(), autoEnabled: loadPolicy().auto.enabled, pending, lastCheck: log, installed: existsSync(PLIST) });
+  out({ free: freeSpace(), autoEnabled: loadPolicy().auto.enabled, pending, lastCheck: log, installed: existsSync(PLIST), accuracy: accuracy() });
+}
+
+// Per source: how much applying actually freed vs what was estimated. A median ratio under 0.5 means the estimate is off.
+function accuracy() {
+  const path = join(STATE, "history.jsonl");
+  if (!existsSync(path)) return {};
+  const by = new Map<string, { estimated: number; measured: number }[]>();
+  for (const line of readFileSync(path, "utf8").split("\n").filter(Boolean)) {
+    let h: any;
+    try { h = JSON.parse(line); } catch { continue; }
+    const ms = h.measurements ?? (h.cleaners ?? []).map((c: any) => ({ source: c.cleaner, estimated: c.estimated, measured: c.measured }));
+    for (const m of ms) if (m.estimated > 0) by.set(m.source, [...(by.get(m.source) ?? []), m]);
+  }
+  const result: Record<string, object> = {};
+  for (const [source, ms] of by) {
+    const ratios = ms.map((m) => m.measured / m.estimated).sort((a, b) => a - b);
+    const median = ratios.length % 2 ? ratios[(ratios.length - 1) / 2] : (ratios[ratios.length / 2 - 1] + ratios[ratios.length / 2]) / 2;
+    result[source] = { runs: ms.length, estimatedBytes: ms.reduce((n, m) => n + m.estimated, 0), measuredBytes: ms.reduce((n, m) => n + m.measured, 0),
+      medianRatio: Number(median.toFixed(2)), estimateOff: median < 0.5 };
+  }
+  return result;
 }
 
 const tilde = (p: string) => (under(p, HOME) ? "~" + p.slice(HOME.length) : p);

@@ -51,6 +51,7 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `cleaners[]` | 도구의 공식 prune을 감싼 플러그인. `{id, tier, detect, size, dryRun?, apply, shadow?, enabled?}`. 아래 참고 |
 | `archives[]` | `{id, paths, match, olderThanDays, tier}`. `match`(정규식)에 맞고 `olderThanDays` 넘게 안 바뀐, 열려 있지 않은(lsof) 파일을 `zstd --rm`으로 압축한다. 삭제하지 않는다 |
 | `staleDirs[]` | `{id, parent, keep?: {symlink?, cmd?}, keepNewest?, olderThanDays?, tier}`. `parent`의 하위 디렉터리 중 현재 버전(심볼릭 링크 대상, 명령 출력의 마지막 경로 성분, 최신 N개)을 빼고 제안한다. 현재 버전을 알 수 없으면 아무것도 제안하지 않는다 |
+| `brewDuplicates` | `{tier}`(auto여도 approve로 취급). 같은 계열의 버전 formula(node@22+node@24) 중 오래되고 설치된 의존자가 없는 것을 `brew uninstall`로 제안 |
 | `clones` | `{namePatterns, idleDays}`. 일회성 클론 탐지. 아래 참고 |
 | `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
@@ -78,6 +79,18 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 ### 일회성 클론 (항상 approve, auto 금지)
 
 이름 패턴(`-backup-YYYYMMDD`, `-prN-review` 등)이나 같은 origin을 가진 다른 클론이 있으면 의심 대상이다. origin마다 대표 클론 하나(origin 리포 이름과 같은 것, 없으면 최신 커밋)는 절대 제안하지 않는다. 제안 조건: `idleDays` 넘게 유휴, `git status` 깨끗, stash 0, 링크된 워크트리 없음, 모든 커밋이 원격에 있음(아니면 `git cherry`로 이미 upstream에 있거나 그 브랜치 PR이 MERGED — 스쿨시 머지 보완), 열린 PR 없음(`gh pr list --head`). origin이 없으면 제외하고 사람이 비교한다. 제안에는 지우면 사라질 ignored 파일 목록(`git status --ignored`, 예: `.env`)을 함께 담는다.
+
+### 모델·앱 캐시·Homebrew (approve)
+
+`staleDirs`의 추가 옵션: `match`(하위 이름 화이트리스트), `lastAccessDays`(안의 파일 중 가장 최근 atime 기준), `unlessRunning`(그 이름의 프로세스가 돌면 규칙 전체를 건너뜀), `parent`가 `/*`로 끝나면 각 하위마다 규칙 적용(`{name}` 치환).
+
+- `hf-models`: `~/.cache/huggingface/hub/models--*` 중 60일 넘게 읽지 않은 것.
+- `app-cache-aside`: `~/Library/Caches/Aside`, Aside가 꺼져 있을 때만. 다른 앱은 이름을 화이트리스트에 더해야 본다.
+- `brew-old-kegs`: Cellar의 각 formula에서 `/opt/homebrew/opt/<name>`이 가리키는 버전 외(오래된 formula라 `brew cleanup`이 건너뛰는 구버전).
+
+### 추정 정확도
+
+`apply`는 출처(cleaner id, archive id, staleDirs id, `clone`, `brew_dup`)마다 `estimated`와 `measured`(적용 전후 Data 볼륨 여유 공간 차이)를 history의 `measurements`에 남긴다. `sweepy status`의 `accuracy`가 출처별 횟수·합계·비율 중앙값을 보여 주고, 중앙값이 0.5 미만이면 `estimateOff: true`다(추정식을 고칠 때). 한 번에 여러 항목을 동시에 적용하면 다른 프로세스의 쓰기가 섭여 오차가 생긴다.
 
 테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 
