@@ -51,7 +51,9 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `cleaners[]` | 도구의 공식 prune을 감싼 플러그인. `{id, tier, detect, size, dryRun?, apply, shadow?, enabled?}`. 아래 참고 |
 | `archives[]` | `{id, paths, match, olderThanDays, tier}`. `match`(정규식)에 맞고 `olderThanDays` 넘게 안 바뀐, 열려 있지 않은(lsof) 파일을 `zstd --rm`으로 압축한다. 삭제하지 않는다 |
 | `staleDirs[]` | `{id, parent, keep?: {symlink?, cmd?}, keepNewest?, olderThanDays?, tier}`. `parent`의 하위 디렉터리 중 현재 버전(심볼릭 링크 대상, 명령 출력의 마지막 경로 성분, 최신 N개)을 빼고 제안한다. 현재 버전을 알 수 없으면 아무것도 제안하지 않는다 |
-| `brewDuplicates` | `{tier}`(auto여도 approve로 취급). 같은 계열의 버전 formula(node@22+node@24) 중 오래되고 설치된 의존자가 없는 것을 `brew uninstall`로 제안 |
+| `brewDuplicates` | `{tier}`(auto여도 approve로 취급). 같은 계열의 버전 formula(node@22+node@24) 중 오래되고 설치된 의존자(`brew uses --installed --recursive`)가 없고 `brew leaves`에 있으며 어디서도 참조되지 않는 것을 `brew uninstall`로 제안. 버전 붙은 formula는 `brew.allowVersionedRemoval: true`일 때만 후보 |
+| `brew` | `{allowVersionedRemoval}`(기본 false) |
+| `referenceRoots` | 참조 검사에 더할 파일·디렉터리. 기본: `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `~/.dori`, `~/.local/bin`, 셸 rc 파일. 텍스트 파일(512KB 이하, node_modules·.git 제외, 15초 제한)에 후보의 keg 이름이나 `opt`/`Cellar` 경로가 나오면 `referenced_by <파일>`로 제외. staleDirs는 `checkReferences: true`일 때 경로 자체를 검사 |
 | `clones` | `{namePatterns, idleDays}`. 일회성 클론 탐지. 아래 참고 |
 | `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
@@ -107,6 +109,7 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 - **스캔 범위를 좁혀야 macOS 권한 대화상자가 안 뜬다.** launchd에서 실행된 void는 권한을 자기 이름으로 물어서, 홈 전체를 스캔하면 다운로드·데스크톱·사진 폴더 대화상자가 떠서 멈춘다(실측 4건). sweepy는 `roots`만 스캔해서 0건, 약 10초에 끝난다. 그래서 워크트리도 Void 대신 git으로 직접 찾는다.
 - **Void의 `blocked_paths`는 계획에 그대로 나온다.** apply에서만 거부되므로 sweepy가 `protect`로 먼저 거른다.
 - **보고된 회수량과 실제 증가량은 다르다.** pnpm·Bun은 APFS 복제로 블록을 공유한다. sweepy는 실측값만 기록한다.
+- **경로로 직접 쓰이는 버전 formula를 지우면 서비스가 깨진다.** 2026-10-19 brew_dup approve로 `node@24`·`python@3.13`을 지웠는데 LaunchAgent plist와 `~/.dori` 스크립트가 `/opt/homebrew/opt/node@24/bin/node`를 직접 써서 Slack 브리지가 멈췄다. 그래서 참조 검사를 하고 버전 formula는 기본 제외한다.
 - **Docker는 Colima 안에 있다.** 범위 밖이지만, `docker builder prune` 뒤에 `colima ssh -- sudo fstrim -av`를 해야 공간이 돌아온다.
 
 ## 제거

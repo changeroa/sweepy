@@ -26,7 +26,7 @@ type Archive = { id: string; paths: string[]; match: string; olderThanDays: numb
 // child's name. `match` whitelists child names; `lastAccessDays` uses the newest atime of any file inside;
 // `unlessRunning` skips the whole rule while a process with that exact name runs.
 type StaleDirs = { id: string; parent: string; keep?: { symlink?: string; cmd?: string[] }; keepNewest?: number; olderThanDays?: number;
-  match?: string; lastAccessDays?: number; unlessRunning?: string; tier: Tier };
+  match?: string; lastAccessDays?: number; unlessRunning?: string; checkReferences?: boolean; tier: Tier };
 const ZSTD_RATIO = 0.15; // jsonl session logs compress to roughly this fraction; the estimate is size * (1 - ratio)
 // A cleaner wraps a tool's own prune command. size: `cmd` output (optionally via `pattern` capture group),
 // or du over `du` paths, or du over the path printed by `duOf`. `shadow` cleaners are only recorded, never run by auto.
@@ -52,6 +52,8 @@ type Policy = {
   staleDirs?: StaleDirs[];
   clones?: { namePatterns: string[]; idleDays: number };
   brewDuplicates?: { tier: Tier };
+  brew?: { allowVersionedRemoval?: boolean };
+  referenceRoots?: string[];
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -332,10 +334,49 @@ function scanHousekeeping(policy: Policy, inUse: string[], items: Item[], exclud
     for (const p of staleDirCandidates(s)) {
       if (underAny(p, policy.protect)) { excluded.push({ kind: "stale_dir", path: p, reason: "protected path" }); continue; }
       if (inUse.some((c) => under(c, p))) { excluded.push({ kind: "stale_dir", path: p, reason: "in use by a running process" }); continue; }
+      const ref = s.checkReferences ? referencedBy(policy, [p, p.replace(/^\/opt\/homebrew\//, "/usr/local/")].filter((x, i, a) => a.indexOf(x) === i)) : null;
+      if (ref) { excluded.push({ kind: "stale_dir", path: p, reason: `referenced_by ${ref}` }); continue; }
       const why = s.lastAccessDays != null ? `not accessed for ${s.lastAccessDays}d` : s.keep || s.keepNewest ? "not the current version" : s.olderThanDays ? `untouched ${s.olderThanDays}d` : "whitelisted cache";
       items.push({ tier: s.tier, kind: "stale_dir", path: p, repo: s.id, bytes: duBytes(p), reason: `${s.id}: ${why}` });
     }
   }
+}
+
+// Paths other programs run directly (launchd plists, ~/.dori scripts, shell rc files) must survive cleanup:
+// a candidate whose path or keg name appears in one of these text files is excluded as referenced_by <file>.
+const REFERENCE_FILE_MAX = 512 * 1024, REFERENCE_FILES_MAX = 20_000, REFERENCE_DEADLINE_MS = 15_000;
+let referenceCorpus: { path: string; text: string }[] | null = null;
+function referenceTexts(policy: Policy): { path: string; text: string }[] {
+  if (referenceCorpus) return referenceCorpus;
+  const roots = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons", "~/.dori", "~/.local/bin",
+    "~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile", "~/.profile", ...(policy.referenceRoots ?? [])].map(real);
+  const out: { path: string; text: string }[] = [];
+  const deadline = Date.now() + REFERENCE_DEADLINE_MS;
+  const visit = (p: string) => {
+    if (out.length >= REFERENCE_FILES_MAX || Date.now() > deadline) return;
+    let st;
+    try { st = statSync(p); } catch { return; }
+    if (st.isDirectory()) {
+      const name = p.split("/").at(-1)!;
+      if (name === "node_modules" || name === ".git") return;
+      let names: string[] = [];
+      try { names = readdirSync(p); } catch { return; }
+      for (const n of names) visit(join(p, n));
+      return;
+    }
+    if (!st.isFile() || st.size > REFERENCE_FILE_MAX) return;
+    let buf: Buffer;
+    try { buf = readFileSync(p); } catch { return; }
+    if (buf.subarray(0, 4096).includes(0)) return; // binary
+    out.push({ path: p, text: buf.toString("utf8") });
+  };
+  roots.forEach(visit);
+  return (referenceCorpus = out);
+}
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function referencedBy(policy: Policy, needles: string[]): string | null {
+  const res = needles.map((n) => new RegExp(`(?<![\\w@.-])${escapeRe(n)}(?![\\w.@-])`));
+  return referenceTexts(policy).find((f) => res.some((r) => r.test(f.text)))?.path ?? null;
 }
 
 // Several installed versions of one versioned formula (node@22 + node@24): propose the older ones nothing depends on.
@@ -347,12 +388,18 @@ function scanBrewDuplicates(policy: Policy, items: Item[], excluded: Excluded[])
   const ver = (n: string) => (n.includes("@") ? n.split("@")[1].split(".").map(Number) : [Infinity]);
   const newer = (a: string, b: string) => { const [x, y] = [ver(a), ver(b)]; for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0); return false; };
   const cellar = run(["brew", "--cellar"]).out.trim();
+  const prefix = run(["brew", "--prefix"]).out.trim() || "/opt/homebrew";
+  const leaves = new Set(run(["brew", "leaves"], { timeoutMs: 60_000 }).out.split("\n").filter(Boolean));
   for (const [, members] of families) {
     if (members.length < 2 || !members.some((m) => m.includes("@"))) continue;
     const latest = members.reduce((a, b) => (newer(b, a) ? b : a));
     for (const m of members.filter((x) => x !== latest)) {
-      const users = run(["brew", "uses", "--installed", m], { timeoutMs: 60_000 }).out.split("\n").filter(Boolean);
+      const users = run(["brew", "uses", "--installed", "--recursive", m], { timeoutMs: 60_000 }).out.split("\n").filter(Boolean);
       if (users.length > 0) { excluded.push({ kind: "brew_dup", path: m, reason: `needed by ${users.join(", ")}` }); continue; }
+      if (!leaves.has(m)) { excluded.push({ kind: "brew_dup", path: m, reason: "not in brew leaves (another formula depends on it)" }); continue; }
+      const ref = referencedBy(policy, [m, `${prefix}/opt/${m}`, `/opt/homebrew/opt/${m}`, `${cellar}/${m}`, `/opt/homebrew/Cellar/${m}`]);
+      if (ref) { excluded.push({ kind: "brew_dup", path: m, reason: `referenced_by ${ref}` }); continue; }
+      if (m.includes("@") && !policy.brew?.allowVersionedRemoval) { excluded.push({ kind: "brew_dup", path: m, reason: "versioned formula (brew.allowVersionedRemoval is off)" }); continue; }
       items.push({ tier: policy.brewDuplicates.tier === "auto" ? "approve" : policy.brewDuplicates.tier, kind: "brew_dup", path: m,
         bytes: duBytes(join(cellar, m)), reason: `older than ${latest}, no installed dependents (brew uninstall ${m})` });
     }

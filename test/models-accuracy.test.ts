@@ -53,17 +53,45 @@ test("brew duplicates: older versioned formula without dependents is proposed, a
   s.tool("brew", `echo "$*" >> "${calls}"; case "$*" in
     "list --formula") printf 'node@22\\nnode@24\\npython@3.13\\npython@3.14\\njq\\n';;
     "--cellar") echo /nonexistent;;
-    "uses --installed python@3.13") echo some-tool;;
+    "--prefix") echo /nonexistent;;
+    leaves) printf 'node@22\npython@3.13\njq\n';;
+    "uses --installed --recursive python@3.13") echo some-tool;;
     "uses --installed"*) ;;
   esac`);
   s.tool("du", 'echo "1	$2"');
+  const home = join(s.dir, "home"); mkdirSync(home);
   setPolicy(s, { brewDuplicates: { tier: "auto" } });
-  const p = JSON.parse((await s.run(["scan"])).stdout);
+  const off = JSON.parse((await s.run(["scan"], { HOME: home })).stdout);
+  expect(off.items.filter((i: any) => i.kind === "brew_dup")).toEqual([]);
+  expect(off.excluded).toContainEqual({ kind: "brew_dup", path: "node@22", reason: "versioned formula (brew.allowVersionedRemoval is off)" });
+  setPolicy(s, { brewDuplicates: { tier: "auto" }, brew: { allowVersionedRemoval: true } });
+  const p = JSON.parse((await s.run(["scan"], { HOME: home })).stdout);
   expect(p.items.filter((i: any) => i.kind === "brew_dup").map((i: any) => [i.path, i.tier])).toEqual([["node@22", "approve"]]);
   expect(p.excluded).toContainEqual({ kind: "brew_dup", path: "python@3.13", reason: "needed by some-tool" });
-  const r = JSON.parse((await s.run(["apply", p.id])).stdout);
+  const r = JSON.parse((await s.run(["apply", p.id], { HOME: home })).stdout);
   expect(r.measurements.map((m: any) => m.source)).toEqual(["brew_dup"]);
   expect(readFileSync(calls, "utf8")).toContain("uninstall node@22");
+}, 30_000);
+
+test("brew duplicates referenced by a launchd plist are excluded even when versioned removal is allowed", async () => {
+  const s = sandbox();
+  s.tool("brew", `case "$*" in
+    "list --formula") printf 'node@24\\nnode@25\\npython@3.13\\npython@3.14\\n';;
+    "--cellar") echo /opt/homebrew/Cellar;;
+    "--prefix") echo /opt/homebrew;;
+    leaves) printf 'node@24\\nnode@25\\npython@3.13\\npython@3.14\\n';;
+  esac`);
+  s.tool("du", 'echo "1	$2"');
+  const home = join(s.dir, "home"), agents = join(home, "Library/LaunchAgents"), extra = join(s.dir, "scripts");
+  mkdirSync(agents, { recursive: true }); mkdirSync(extra);
+  writeFileSync(join(agents, "com.example.bridge.plist"), "<plist><array><string>/opt/homebrew/opt/node@24/bin/node</string></array></plist>");
+  writeFileSync(join(extra, "run"), "#!/bin/sh\nexec /opt/homebrew/opt/python@3.13/bin/python3.13 job.py\n");
+  setPolicy(s, { brewDuplicates: { tier: "approve" }, brew: { allowVersionedRemoval: true }, referenceRoots: [extra] });
+  const p = JSON.parse((await s.run(["scan"], { HOME: home })).stdout);
+  expect(p.items.filter((i: any) => i.kind === "brew_dup")).toEqual([]);
+  const reasons = Object.fromEntries(p.excluded.filter((e: any) => e.kind === "brew_dup").map((e: any) => [e.path, e.reason]));
+  expect(reasons["node@24"]).toBe(`referenced_by ${realpathSync(agents)}/com.example.bridge.plist`);
+  expect(reasons["python@3.13"]).toBe(`referenced_by ${realpathSync(extra)}/run`);
 }, 30_000);
 
 test("status shows per-source estimate accuracy and flags median ratio under 0.5", async () => {
