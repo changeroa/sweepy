@@ -246,5 +246,16 @@
       "olderThanDays": 30,
       "tier": "approve"
     }
-  ]
+  ],
+  "clones": {
+    "idleDays": 14,
+    "namePatterns": [
+      "-backup-\\d{8}$",
+      "-pr\\d+-review$",
+      "-worktree$",
+      "-baseline$",
+      "-old-",
+      "-wip-backup"
+    ]
+  }
 }
