@@ -245,6 +245,28 @@
       "parent": "~/.npm/_npx",
       "olderThanDays": 30,
       "tier": "approve"
+    },
+    {
+      "id": "hf-models",
+      "parent": "~/.cache/huggingface/hub",
+      "match": "^models--",
+      "lastAccessDays": 60,
+      "tier": "approve"
+    },
+    {
+      "id": "app-cache-aside",
+      "parent": "~/Library/Caches",
+      "match": "^Aside$",
+      "unlessRunning": "Aside",
+      "tier": "approve"
+    },
+    {
+      "id": "brew-old-kegs",
+      "parent": "/opt/homebrew/Cellar/*",
+      "keep": {
+        "symlink": "/opt/homebrew/opt/{name}"
+      },
+      "tier": "approve"
     }
   ],
   "clones": {
@@ -257,5 +279,8 @@
       "-old-",
       "-wip-backup"
     ]
+  },
+  "brewDuplicates": {
+    "tier": "approve"
   }
 }
