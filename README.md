@@ -29,6 +29,7 @@ bin/sweepy apply <id>              # approve 등급 적용
 bin/sweepy apply <id> --tier auto  # auto 등급 적용
 bin/sweepy check                   # launchd가 부르는 것: scan + auto(또는 shadow) + inbox
 bin/sweepy status                  # 여유 공간, 대기 중인 제안, 마지막 실행
+bin/sweepy report [--json]         # 디스크를 어디가 쓰는지 표(policy.report 대상 du, 큰 순)
 bin/sweepy install | uninstall     # launchd(dev.sweepy.check) 등록/해제
 sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대화상자 점검
 ```
@@ -46,8 +47,13 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `auto.enabled` | `false`면 auto 등급을 기록만 한다. history의 shadow 기록을 보고 오판이 없으면 켠다 |
 | `inbox.minBytes` | 이 이상 모일 때만 inbox에 제안 |
 | `proposalTtlHours` | 제안 유효 시간 |
+| `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
-환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_INTERVAL`(초, install 때).
+환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_DU_TIMEOUT`(초, 기본 60), `SWEEPY_DU_CACHE_HOURS`(기본 24), `SWEEPY_INTERVAL`(초, install 때).
+
+크기 측정(`du -sk`)은 프로세스 마감 시간 안에서만 돈다(macOS엔 `timeout`이 없다). 결과는 `du-cache.json`에 경로별로 남기고, 디렉터리 자체의 mtime이 그대로이고 `SWEEPY_DU_CACHE_HOURS`보다 젊으면 다시 재지 않는다(최상위 mtime은 깊은 곳의 변화를 못 보므로 나이 제한이 있다). 출력·제안·로그·history에 나가는 원격 URL 자격증명(`https://user:token@`)과 GitHub 토큰은 `***`로 가린다.
+
+테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 
 ## 설치
 

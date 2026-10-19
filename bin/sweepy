@@ -9,6 +9,8 @@ const STATE = process.env.SWEEPY_STATE_DIR ?? join(HOME, ".local/state/sweepy");
 const VOID = process.env.SWEEPY_VOID ?? join(HOME, ".local/bin/void");
 const POLICY_PATH = process.env.SWEEPY_POLICY ?? join(REPO, "policy.json");
 const SCAN_TIMEOUT_MS = Number(process.env.SWEEPY_SCAN_TIMEOUT ?? 120) * 1000;
+const DU_TIMEOUT_MS = Number(process.env.SWEEPY_DU_TIMEOUT ?? 60) * 1000;
+const DU_CACHE_MAX_AGE_MS = Number(process.env.SWEEPY_DU_CACHE_HOURS ?? 24) * 3_600_000;
 const LABEL = "dev.sweepy.check";
 const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
@@ -27,7 +29,13 @@ type Policy = {
   artifacts: { kinds: string[]; ecosystems: string[]; staleDays: number };
   worktrees: { idleDays: number }; auto: { enabled: boolean };
   inbox: { minBytes: number }; proposalTtlHours: number;
+  report?: { paths?: string[]; childrenOf?: string[]; top?: number };
 };
+
+// Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
+const redact = (s: string) => s
+  .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s\/@'"]+@/gi, "$1***@")
+  .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}/g, "$1***");
 
 function real(p: string): string {
   const expanded = p.startsWith("~/") ? join(HOME, p.slice(2)) : p;
@@ -50,10 +58,28 @@ function freeSpace(): Free {
   const r = run([VOID, "--json", "guard", "check"]);
   try { return JSON.parse(r.out); } catch { return null; }
 }
-function duBytes(p: string): number {
-  const r = run(["du", "-sk", p]);
-  return (Number(r.out.split(/\s+/)[0]) || 0) * 1024;
+// du can take minutes on big trees (and macOS has no `timeout`), so it runs under a process deadline.
+// Results are cached per path and reused while the directory's own mtime is unchanged and the entry is
+// younger than SWEEPY_DU_CACHE_HOURS (a top-level mtime does not see changes deep inside the tree).
+type DuEntry = { mtimeMs: number; bytes: number; at: number };
+let duCache: Record<string, DuEntry> | null = null;
+const duCachePath = () => join(STATE, "du-cache.json");
+function duMeasure(p: string): { bytes: number | null; cached: boolean; timedOut: boolean } {
+  let mtimeMs: number;
+  try { mtimeMs = statSync(p).mtimeMs; } catch { return { bytes: null, cached: false, timedOut: false }; }
+  if (!duCache) { try { duCache = JSON.parse(readFileSync(duCachePath(), "utf8")); } catch { duCache = {}; } }
+  const hit = duCache![p];
+  if (hit && hit.mtimeMs === mtimeMs && Date.now() - hit.at < DU_CACHE_MAX_AGE_MS) return { bytes: hit.bytes, cached: true, timedOut: false };
+  const r = run(["du", "-sk", p], { timeoutMs: DU_TIMEOUT_MS });
+  if (r.killed) return { bytes: null, cached: false, timedOut: true };
+  const kb = Number(r.out.split(/\s+/)[0]);
+  if (!Number.isFinite(kb) || r.out.trim() === "") return { bytes: null, cached: false, timedOut: false };
+  duCache![p] = { mtimeMs, bytes: kb * 1024, at: Date.now() };
+  mkdirSync(STATE, { recursive: true });
+  writeFileSync(duCachePath(), JSON.stringify(duCache));
+  return { bytes: kb * 1024, cached: false, timedOut: false };
 }
+const duBytes = (p: string) => duMeasure(p).bytes ?? 0;
 function cwdsInUse(): string[] {
   return run(["lsof", "-d", "cwd", "-Fn"]).out.split("\n").filter((l) => l.startsWith("n/")).map((l) => l.slice(1));
 }
@@ -139,7 +165,8 @@ function scanArtifacts(policy: Policy, worktrees: Worktree[], inUse: string[], i
   const r = run([VOID, "--json", "--config", voidConfig(policy), "scan"], { timeoutMs: SCAN_TIMEOUT_MS });
   let found: any[];
   try { found = JSON.parse(r.out); } catch {
-    errors.push(`void scan ${r.killed ? `exceeded ${SCAN_TIMEOUT_MS / 1000}s` : `failed (exit ${r.code})`}; macOS privacy prompts in last 10m: ${tccPrompts()}`);
+    const detail = r.err.trim().split("\n").at(-1)?.slice(0, 300);
+    errors.push(`void scan ${r.killed ? `exceeded ${SCAN_TIMEOUT_MS / 1000}s` : `failed (exit ${r.code})${detail ? `: ${detail}` : ""}`}; macOS privacy prompts in last 10m: ${tccPrompts()}`);
     return;
   }
   for (const a of found) {
@@ -175,7 +202,7 @@ function scan(): Proposal {
     autoEnabled: policy.auto.enabled, free: freeSpace(), items, excluded, errors,
   };
   mkdirSync(join(STATE, "proposals"), { recursive: true });
-  writeFileSync(join(STATE, "proposals", `${proposal.id}.json`), JSON.stringify(proposal, null, 2));
+  writeFileSync(join(STATE, "proposals", `${proposal.id}.json`), redact(JSON.stringify(proposal, null, 2)));
   return proposal;
 }
 
@@ -183,7 +210,7 @@ const key = (i: Item) => `${i.kind}|${i.path}`;
 const sum = (xs: Item[]) => xs.reduce((n, i) => n + i.bytes, 0);
 function history(entry: object) {
   mkdirSync(STATE, { recursive: true });
-  appendFileSync(join(STATE, "history.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+  appendFileSync(join(STATE, "history.jsonl"), redact(JSON.stringify({ ts: new Date().toISOString(), ...entry })) + "\n");
 }
 
 function apply(id: string, tier: Tier) {
@@ -265,12 +292,12 @@ function check() {
   else {
     pending.forEach((q) => rmSync(join(inbox, `${q.id}.json`), { force: true }));
     if (worthIt) {
-      writeFileSync(join(inbox, `${p.id}.json`), JSON.stringify({ ...p, signature }, null, 2));
+      writeFileSync(join(inbox, `${p.id}.json`), redact(JSON.stringify({ ...p, signature }, null, 2)));
       inboxState = `new ${p.id}`;
     }
   }
   const line = `${new Date().toISOString()} free=${p.free?.state ?? "?"}/${p.free?.free_percent?.toFixed(1) ?? "?"}% auto=${auto.length}(${policy.auto.enabled ? "applied" : "shadow"}) approve=${approve.length}/${(sum(approve) / 2 ** 30).toFixed(2)}GiB inbox=${inboxState}${p.errors.length ? ` errors=${p.errors.join("; ")}` : ""}\n`;
-  appendFileSync(join(STATE, "sweepy.log"), line);
+  appendFileSync(join(STATE, "sweepy.log"), redact(line));
   out({ proposal: p.id, auto: auto.length, approve: approve.length, inbox: inboxState, errors: p.errors });
 }
 
@@ -283,6 +310,43 @@ function status() {
   }) : [];
   const log = existsSync(join(STATE, "sweepy.log")) ? readFileSync(join(STATE, "sweepy.log"), "utf8").trim().split("\n").at(-1) : null;
   out({ free: freeSpace(), autoEnabled: loadPolicy().auto.enabled, pending, lastCheck: log, installed: existsSync(PLIST) });
+}
+
+const tilde = (p: string) => (under(p, HOME) ? "~" + p.slice(HOME.length) : p);
+function diskUsage() {
+  const f = run(["df", "-k", "/"]).out.trim().split("\n").at(-1)?.split(/\s+/) ?? [];
+  const [size, used, avail] = [f[1], f[2], f[3]].map((x) => Number(x) * 1024);
+  return Number.isFinite(size) ? { size_bytes: size, used_bytes: used, avail_bytes: avail } : null;
+}
+
+// Where is the disk going? du over policy.report targets (plus each child of report.childrenOf), biggest first.
+function report(json: boolean) {
+  const policy = loadPolicy();
+  const cfg = policy.report ?? {};
+  const targets = new Set<string>();
+  for (const p of cfg.paths ?? []) if (existsSync(real(p))) targets.add(real(p));
+  for (const parent of cfg.childrenOf ?? []) {
+    const d = real(parent);
+    try { for (const e of readdirSync(d, { withFileTypes: true })) if (e.isDirectory() && !e.isSymbolicLink()) targets.add(join(d, e.name)); } catch {}
+  }
+  const rows = [...targets].map((path) => {
+    const m = duMeasure(path);
+    let modified = "";
+    try { modified = new Date(statSync(path).mtimeMs).toISOString().slice(0, 10); } catch {}
+    const coverage = underAny(path, policy.protect) ? "protect" : underAny(path, policy.roots) ? "roots" : "outside";
+    return { path, bytes: m.bytes, timedOut: m.timedOut, cached: m.cached, modified, coverage };
+  }).sort((a, b) => (b.bytes ?? -1) - (a.bytes ?? -1)).slice(0, cfg.top ?? 30);
+  const disk = diskUsage();
+  if (json) return out({ disk, rows });
+  const gb = (b: number | null | undefined) => (b == null ? "?" : (b / 1e9).toFixed(1));
+  const lines = [
+    `disk: used ${gb(disk?.used_bytes)} GB, free ${gb(disk?.avail_bytes)} GB of ${gb(disk?.size_bytes)} GB`,
+    "",
+    "| path | GB | modified | sweepy |",
+    "|---|---|---|---|",
+    ...rows.map((r) => `| ${tilde(r.path)} | ${r.timedOut ? `timeout >${DU_TIMEOUT_MS / 1000}s` : gb(r.bytes)} | ${r.modified} | ${r.coverage} |`),
+  ];
+  console.log(redact(lines.join("\n")));
 }
 
 function install() {
@@ -315,8 +379,8 @@ function uninstall() {
   out({ removed: LABEL, stateKept: STATE });
 }
 
-function out(v: unknown) { console.log(JSON.stringify(v, null, 2)); }
-function fail(msg: string) { console.error(JSON.stringify({ error: msg })); process.exitCode = 1; }
+function out(v: unknown) { console.log(redact(JSON.stringify(v, null, 2))); }
+function fail(msg: string) { console.error(redact(JSON.stringify({ error: msg }))); process.exitCode = 1; }
 
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const tierFlag = [arg, ...rest].includes("--tier") ? ([arg, ...rest][[arg, ...rest].indexOf("--tier") + 1] as Tier) : "approve";
@@ -325,7 +389,8 @@ switch (cmd) {
   case "apply": if (!arg || arg.startsWith("--")) fail("usage: sweepy apply <proposal-id> [--tier approve|auto]"); else apply(arg, tierFlag); break;
   case "check": check(); break;
   case "status": status(); break;
+  case "report": report(arg === "--json"); break;
   case "install": install(); break;
   case "uninstall": uninstall(); break;
-  default: fail("usage: sweepy scan | apply <id> [--tier approve|auto] | check | status | install | uninstall"); process.exitCode = 2;
+  default: fail("usage: sweepy scan | apply <id> [--tier approve|auto] | check | status | report [--json] | install | uninstall"); process.exitCode = 2;
 }
