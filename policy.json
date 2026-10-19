@@ -197,5 +197,54 @@
         ]
       ]
     }
+  ],
+  "archives": [
+    {
+      "id": "codex-sessions",
+      "paths": [
+        "~/.codex/sessions"
+      ],
+      "match": "\\.jsonl$",
+      "olderThanDays": 30,
+      "tier": "approve"
+    },
+    {
+      "id": "claude-projects",
+      "paths": [
+        "~/.claude/projects"
+      ],
+      "match": "\\.jsonl$",
+      "olderThanDays": 30,
+      "tier": "approve"
+    }
+  ],
+  "staleDirs": [
+    {
+      "id": "codex-releases",
+      "parent": "~/.codex/packages/standalone/releases",
+      "keep": {
+        "symlink": "~/.codex/packages/standalone/current"
+      },
+      "keepNewest": 1,
+      "tier": "approve"
+    },
+    {
+      "id": "pnpm-old-stores",
+      "parent": "~/Library/pnpm/store",
+      "keep": {
+        "cmd": [
+          "pnpm",
+          "store",
+          "path"
+        ]
+      },
+      "tier": "approve"
+    },
+    {
+      "id": "npx-cache",
+      "parent": "~/.npm/_npx",
+      "olderThanDays": 30,
+      "tier": "approve"
+    }
   ]
 }

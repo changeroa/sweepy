@@ -49,6 +49,8 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `inbox.minBytes` | 이 이상 모일 때만 inbox에 제안 |
 | `proposalTtlHours` | 제안 유효 시간 |
 | `cleaners[]` | 도구의 공식 prune을 감싼 플러그인. `{id, tier, detect, size, dryRun?, apply, shadow?, enabled?}`. 아래 참고 |
+| `archives[]` | `{id, paths, match, olderThanDays, tier}`. `match`(정규식)에 맞고 `olderThanDays` 넘게 안 바뀐, 열려 있지 않은(lsof) 파일을 `zstd --rm`으로 압축한다. 삭제하지 않는다 |
+| `staleDirs[]` | `{id, parent, keep?: {symlink?, cmd?}, keepNewest?, olderThanDays?, tier}`. `parent`의 하위 디렉터리 중 현재 버전(심볼릭 링크 대상, 명령 출력의 마지막 경로 성분, 최신 N개)을 빼고 제안한다. 현재 버전을 알 수 없으면 아무것도 제안하지 않는다 |
 | `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
 환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_DU_TIMEOUT`(초, 기본 60), `SWEEPY_DU_CACHE_HOURS`(기본 24), `SWEEPY_INTERVAL`(초, install 때).
@@ -62,6 +64,15 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 기본 cleaner: brew(`brew cleanup --prune=30`), uv(`uv cache prune`), pnpm(`pnpm store prune`), npm(`npm cache verify`). 모두 auto + shadow로 시작한다.
 
 docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `docker system df`의 Images·Build Cache RECLAIMABLE 합(SI 단위). 적용은 `docker builder prune -f` → `docker image prune -f`(dangling만) → `colima ssh -- sudo fstrim -av` 순서로, 앞 단계가 실패하면 멈춘다. fstrim이 돌려주는 VM 디스크 여유분은 추정치에 들어가지 않고 measured에만 나타난다.
+
+### 세션 로그·구버전 (approve)
+
+- `codex-sessions`, `claude-projects`: 30일 넘은 `.jsonl`을 압축. 기억 복구에 쓰라서 지우지 않는다(`zstd -d`로 되돌린다). 추정 회수량은 원본의 85%.
+- `codex-releases`: `~/.codex/packages/standalone/releases` 중 `current`가 가리키는 것과 최신 1개 외.
+- `pnpm-old-stores`: `pnpm store path`(현재 v11) 외의 예전 형식 store(v10, v3). `pnpm store prune`은 이것을 건드리지 않는다.
+- `npx-cache`: 30일 넘게 안 쓴 `~/.npm/_npx/*`. `npm cache verify`는 이것을 치우지 않는다.
+
+`apply`는 압축 직전에 파일이 여전히 오래되고 닫혀 있는지 다시 보고, 승인된 목록과 겹치는 것만 처리한다.
 
 테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 
