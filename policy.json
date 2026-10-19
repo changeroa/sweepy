@@ -1,5 +1,7 @@
 {
-  "roots": ["~/projects"],
+  "roots": [
+    "~/projects"
+  ],
   "protect": [
     "~/.hent-ai",
     "~/deploy",
@@ -8,8 +10,17 @@
     "~/projects/openclaw-runtime"
   ],
   "artifacts": {
-    "kinds": ["node_modules", "target_dir", "framework_build_cache", "pycache_dir"],
-    "ecosystems": ["node", "rust", "python"],
+    "kinds": [
+      "node_modules",
+      "target_dir",
+      "framework_build_cache",
+      "pycache_dir"
+    ],
+    "ecosystems": [
+      "node",
+      "rust",
+      "python"
+    ],
     "staleDays": 14
   },
   "worktrees": {
@@ -21,5 +32,32 @@
   "inbox": {
     "minBytes": 1073741824
   },
-  "proposalTtlHours": 24
+  "proposalTtlHours": 24,
+  "report": {
+    "top": 30,
+    "childrenOf": [
+      "~/projects"
+    ],
+    "paths": [
+      "~/projects",
+      "~/.colima",
+      "/Applications",
+      "/opt/homebrew",
+      "~/.codex",
+      "~/.codex/packages",
+      "~/.codex/sessions",
+      "~/Library/Application Support",
+      "~/Library/Caches",
+      "~/.cache",
+      "~/.cache/uv",
+      "~/.cache/huggingface",
+      "~/.cache/codex-runtimes",
+      "~/Library/pnpm",
+      "~/.npm",
+      "~/.rustup",
+      "~/.bun",
+      "~/.claude",
+      "~/.local"
+    ]
+  }
 }
