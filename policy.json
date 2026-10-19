@@ -59,5 +59,97 @@
       "~/.claude",
       "~/.local"
     ]
-  }
+  },
+  "cleaners": [
+    {
+      "id": "brew",
+      "tier": "auto",
+      "shadow": true,
+      "detect": [
+        "brew",
+        "--version"
+      ],
+      "size": {
+        "cmd": [
+          "brew",
+          "cleanup",
+          "-n",
+          "--prune=30"
+        ],
+        "pattern": "free approximately ([\\d.]+\\s*[KMGT]?B)"
+      },
+      "dryRun": [
+        "brew",
+        "cleanup",
+        "-n",
+        "--prune=30"
+      ],
+      "apply": [
+        "brew",
+        "cleanup",
+        "--prune=30"
+      ]
+    },
+    {
+      "id": "uv",
+      "tier": "auto",
+      "shadow": true,
+      "detect": [
+        "uv",
+        "--version"
+      ],
+      "size": {
+        "duOf": [
+          "uv",
+          "cache",
+          "dir"
+        ]
+      },
+      "apply": [
+        "uv",
+        "cache",
+        "prune"
+      ]
+    },
+    {
+      "id": "pnpm",
+      "tier": "auto",
+      "shadow": true,
+      "detect": [
+        "pnpm",
+        "--version"
+      ],
+      "size": {
+        "duOf": [
+          "pnpm",
+          "store",
+          "path"
+        ]
+      },
+      "apply": [
+        "pnpm",
+        "store",
+        "prune"
+      ]
+    },
+    {
+      "id": "npm",
+      "tier": "auto",
+      "shadow": true,
+      "detect": [
+        "npm",
+        "--version"
+      ],
+      "size": {
+        "du": [
+          "~/.npm/_cacache"
+        ]
+      },
+      "apply": [
+        "npm",
+        "cache",
+        "verify"
+      ]
+    }
+  ]
 }

@@ -16,8 +16,12 @@ const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
 
 type Tier = "auto" | "approve";
-type Kind = "artifact" | "worktree_remove" | "worktree_prune";
-type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string };
+type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner";
+type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean };
+// A cleaner wraps a tool's own prune command. size: `cmd` output (optionally via `pattern` capture group),
+// or du over `du` paths, or du over the path printed by `duOf`. `shadow` cleaners are only recorded, never run by auto.
+type SizeSpec = { cmd?: string[]; pattern?: string; du?: string[]; duOf?: string[] };
+type Cleaner = { id: string; tier: Tier; detect: string[]; size: SizeSpec; dryRun?: string[]; apply: string[]; shadow?: boolean; enabled?: boolean };
 type Excluded = { kind: Kind; path: string; reason: string };
 type Free = { state: string; free_bytes: number; free_percent: number } | null;
 type Proposal = {
@@ -30,6 +34,7 @@ type Policy = {
   worktrees: { idleDays: number }; auto: { enabled: boolean };
   inbox: { minBytes: number }; proposalTtlHours: number;
   report?: { paths?: string[]; childrenOf?: string[]; top?: number };
+  cleaners?: Cleaner[];
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -189,12 +194,46 @@ function scanArtifacts(policy: Policy, worktrees: Worktree[], inUse: string[], i
   }
 }
 
+const UNITS: Record<string, number> = { "": 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 };
+function parseBytes(s: string): number | null {
+  const m = s.match(/([\d.]+)\s*([KMGT]?)i?B?\b/i);
+  return m ? Math.round(Number(m[1]) * UNITS[m[2].toUpperCase()]) : null;
+}
+const installed = (argv: string[]) => Bun.which(argv[0]) != null && run(argv, { timeoutMs: 30_000 }).code === 0;
+
+function cleanerSize(c: Cleaner): number | null {
+  const s = c.size;
+  if (s.cmd) {
+    const r = run(s.cmd, { timeoutMs: SCAN_TIMEOUT_MS });
+    if (r.code !== 0) return null;
+    if (!s.pattern) return parseBytes(r.out.trim());
+    const hit = (r.out + r.err).match(new RegExp(s.pattern));
+    return hit ? parseBytes(hit[1]) : 0;
+  }
+  const paths = s.du ?? (s.duOf ? [run(s.duOf, { timeoutMs: 30_000 }).out.trim()] : []);
+  return paths.filter(Boolean).map(real).filter((p) => existsSync(p)).reduce((n, p) => n + duBytes(p), 0);
+}
+
+function scanCleaners(policy: Policy, items: Item[], excluded: Excluded[]) {
+  for (const c of policy.cleaners ?? []) {
+    if (c.enabled === false) continue;
+    const exclude = (reason: string) => excluded.push({ kind: "cleaner", path: c.id, reason });
+    if (!installed(c.detect)) { exclude("tool not installed"); continue; }
+    const bytes = cleanerSize(c);
+    if (bytes == null) { exclude("size query failed"); continue; }
+    if (bytes === 0) { exclude("nothing to reclaim"); continue; }
+    items.push({ tier: c.tier, kind: "cleaner", path: c.id, bytes, shadow: c.shadow === true,
+      reason: `${c.apply.join(" ")} (estimate from ${c.size.cmd ? c.size.cmd.join(" ") : "du"})${c.shadow ? ", shadow" : ""}` });
+  }
+}
+
 function scan(): Proposal {
   const policy = loadPolicy();
   const items: Item[] = [], excluded: Excluded[] = [], errors: string[] = [];
   const inUse = cwdsInUse();
   const worktrees = scanWorktrees(policy, inUse, items, excluded);
   scanArtifacts(policy, worktrees, inUse, items, excluded, errors);
+  scanCleaners(policy, items, excluded);
   const now = new Date();
   const proposal: Proposal = {
     version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
@@ -220,9 +259,11 @@ function apply(id: string, tier: Tier) {
   if (Date.parse(proposal.expiresAt) < Date.now()) return fail(`proposal ${id} expired at ${proposal.expiresAt}`);
 
   const fresh = new Set(scan().items.filter((i) => i.tier === tier).map(key));
-  const wanted = proposal.items.filter((i) => i.tier === tier);
+  const tierItems = proposal.items.filter((i) => i.tier === tier);
+  const wanted = tier === "auto" ? tierItems.filter((i) => !i.shadow) : tierItems;
   const selected = wanted.filter((i) => fresh.has(key(i)));
   const dropped = wanted.filter((i) => !fresh.has(key(i))).map((i) => ({ path: i.path, kind: i.kind, reason: "no longer eligible" }));
+  tierItems.filter((i) => !wanted.includes(i)).forEach((i) => dropped.push({ path: i.path, kind: i.kind, reason: "shadow mode" }));
   const failures: { path: string; error: string }[] = [];
   const before = freeSpace()?.free_bytes ?? 0;
 
@@ -263,8 +304,18 @@ function apply(id: string, tier: Tier) {
     if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim() });
   }
 
+  const cleaners: { cleaner: string; estimated: number; measured: number }[] = [];
+  for (const i of selected.filter((i) => i.kind === "cleaner")) {
+    const c = loadPolicy().cleaners?.find((x) => x.id === i.path);
+    if (!c) { failures.push({ path: i.path, error: "cleaner no longer in policy" }); continue; }
+    const b = diskUsage()?.avail_bytes ?? 0;
+    const r = run(c.apply, { timeoutMs: 600_000 });
+    cleaners.push({ cleaner: c.id, estimated: i.bytes, measured: (diskUsage()?.avail_bytes ?? 0) - b });
+    if (r.code !== 0) failures.push({ path: i.path, error: r.err.trim().split("\n").at(-1) || `exit ${r.code}` });
+  }
+
   const after = freeSpace()?.free_bytes ?? 0;
-  const result = { proposal: id, tier, mode: "applied", applied: selected.length - failures.length, plannedBytes: sum(selected), freedBytes: after - before, dropped, failures };
+  const result = { proposal: id, tier, mode: "applied", applied: selected.length - failures.length, plannedBytes: sum(selected), freedBytes: after - before, cleaners, dropped, failures };
   history(result);
   if (tier === "approve") rmSync(join(STATE, "inbox", `${id}.json`), { force: true });
   out(result);
@@ -276,10 +327,11 @@ function check() {
   const p = scan();
   const auto = p.items.filter((i) => i.tier === "auto");
   const approve = p.items.filter((i) => i.tier === "approve");
-  if (auto.length > 0) {
-    if (policy.auto.enabled) apply(p.id, "auto");
-    else history({ proposal: p.id, tier: "auto", mode: "shadow", items: auto.length, plannedBytes: sum(auto) });
-  }
+  const live = policy.auto.enabled ? auto.filter((i) => !i.shadow) : [];
+  const shadowed = auto.filter((i) => !live.includes(i));
+  if (live.length > 0) apply(p.id, "auto");
+  if (shadowed.length > 0) history({ proposal: p.id, tier: "auto", mode: "shadow", items: shadowed.length, plannedBytes: sum(shadowed),
+    detail: shadowed.map((i) => ({ kind: i.kind, path: i.path, bytes: i.bytes })) });
 
   const inbox = join(STATE, "inbox");
   mkdirSync(inbox, { recursive: true });
@@ -296,7 +348,7 @@ function check() {
       inboxState = `new ${p.id}`;
     }
   }
-  const line = `${new Date().toISOString()} free=${p.free?.state ?? "?"}/${p.free?.free_percent?.toFixed(1) ?? "?"}% auto=${auto.length}(${policy.auto.enabled ? "applied" : "shadow"}) approve=${approve.length}/${(sum(approve) / 2 ** 30).toFixed(2)}GiB inbox=${inboxState}${p.errors.length ? ` errors=${p.errors.join("; ")}` : ""}\n`;
+  const line = `${new Date().toISOString()} free=${p.free?.state ?? "?"}/${p.free?.free_percent?.toFixed(1) ?? "?"}% auto=${live.length}applied/${shadowed.length}shadow approve=${approve.length}/${(sum(approve) / 2 ** 30).toFixed(2)}GiB inbox=${inboxState}${p.errors.length ? ` errors=${p.errors.join("; ")}` : ""}\n`;
   appendFileSync(join(STATE, "sweepy.log"), redact(line));
   out({ proposal: p.id, auto: auto.length, approve: approve.length, inbox: inboxState, errors: p.errors });
 }
@@ -314,7 +366,9 @@ function status() {
 
 const tilde = (p: string) => (under(p, HOME) ? "~" + p.slice(HOME.length) : p);
 function diskUsage() {
-  const f = run(["df", "-k", "/"]).out.trim().split("\n").at(-1)?.split(/\s+/) ?? [];
+  // On APFS "/" is the sealed system volume; user data lives on the Data volume.
+  const vol = existsSync("/System/Volumes/Data") ? "/System/Volumes/Data" : "/";
+  const f = run(["df", "-k", vol]).out.trim().split("\n").at(-1)?.split(/\s+/) ?? [];
   const [size, used, avail] = [f[1], f[2], f[3]].map((x) => Number(x) * 1024);
   return Number.isFinite(size) ? { size_bytes: size, used_bytes: used, avail_bytes: avail } : null;
 }
@@ -347,6 +401,18 @@ function report(json: boolean) {
     ...rows.map((r) => `| ${tilde(r.path)} | ${r.timedOut ? `timeout >${DU_TIMEOUT_MS / 1000}s` : gb(r.bytes)} | ${r.modified} | ${r.coverage} |`),
   ];
   console.log(redact(lines.join("\n")));
+}
+
+// Show what each cleaner would do, using its own dry-run command when it has one. Never runs `apply`.
+function dryRun(only?: string) {
+  const results = (loadPolicy().cleaners ?? []).filter((c) => c.enabled !== false && (!only || c.id === only)).map((c) => {
+    if (!installed(c.detect)) return { id: c.id, installed: false };
+    const base = { id: c.id, installed: true, tier: c.tier, shadow: c.shadow === true, apply: c.apply.join(" "), estimatedBytes: cleanerSize(c) };
+    if (!c.dryRun) return base;
+    const r = run(c.dryRun, { timeoutMs: SCAN_TIMEOUT_MS });
+    return { ...base, dryRun: c.dryRun.join(" "), exit: r.code, output: (r.out + r.err).trim().split("\n").slice(-15) };
+  });
+  out(results);
 }
 
 function install() {
@@ -390,7 +456,8 @@ switch (cmd) {
   case "check": check(); break;
   case "status": status(); break;
   case "report": report(arg === "--json"); break;
+  case "dry-run": dryRun(arg); break;
   case "install": install(); break;
   case "uninstall": uninstall(); break;
-  default: fail("usage: sweepy scan | apply <id> [--tier approve|auto] | check | status | report [--json] | install | uninstall"); process.exitCode = 2;
+  default: fail("usage: sweepy scan | apply <id> [--tier approve|auto] | check | status | report [--json] | dry-run [cleaner] | install | uninstall"); process.exitCode = 2;
 }
