@@ -51,6 +51,7 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `cleaners[]` | 도구의 공식 prune을 감싼 플러그인. `{id, tier, detect, size, dryRun?, apply, shadow?, enabled?}`. 아래 참고 |
 | `archives[]` | `{id, paths, match, olderThanDays, tier}`. `match`(정규식)에 맞고 `olderThanDays` 넘게 안 바뀐, 열려 있지 않은(lsof) 파일을 `zstd --rm`으로 압축한다. 삭제하지 않는다 |
 | `staleDirs[]` | `{id, parent, keep?: {symlink?, cmd?}, keepNewest?, olderThanDays?, tier}`. `parent`의 하위 디렉터리 중 현재 버전(심볼릭 링크 대상, 명령 출력의 마지막 경로 성분, 최신 N개)을 빼고 제안한다. 현재 버전을 알 수 없으면 아무것도 제안하지 않는다 |
+| `clones` | `{namePatterns, idleDays}`. 일회성 클론 탐지. 아래 참고 |
 | `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
 환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_DU_TIMEOUT`(초, 기본 60), `SWEEPY_DU_CACHE_HOURS`(기본 24), `SWEEPY_INTERVAL`(초, install 때).
@@ -73,6 +74,10 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 - `npx-cache`: 30일 넘게 안 쓴 `~/.npm/_npx/*`. `npm cache verify`는 이것을 치우지 않는다.
 
 `apply`는 압축 직전에 파일이 여전히 오래되고 닫혀 있는지 다시 보고, 승인된 목록과 겹치는 것만 처리한다.
+
+### 일회성 클론 (항상 approve, auto 금지)
+
+이름 패턴(`-backup-YYYYMMDD`, `-prN-review` 등)이나 같은 origin을 가진 다른 클론이 있으면 의심 대상이다. origin마다 대표 클론 하나(origin 리포 이름과 같은 것, 없으면 최신 커밋)는 절대 제안하지 않는다. 제안 조건: `idleDays` 넘게 유휴, `git status` 깨끗, stash 0, 링크된 워크트리 없음, 모든 커밋이 원격에 있음(아니면 `git cherry`로 이미 upstream에 있거나 그 브랜치 PR이 MERGED — 스쿨시 머지 보완), 열린 PR 없음(`gh pr list --head`). origin이 없으면 제외하고 사람이 비교한다. 제안에는 지우면 사라질 ignored 파일 목록(`git status --ignored`, 예: `.env`)을 함께 담는다.
 
 테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 

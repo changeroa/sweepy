@@ -16,8 +16,8 @@ const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
 
 type Tier = "auto" | "approve";
-type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir";
-type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean; files?: string[] };
+type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir" | "clone";
+type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean; files?: string[]; ignored?: string[] };
 // archives: compress (zstd --rm, never delete) files matching `match` under `paths` untouched for olderThanDays and not open.
 type Archive = { id: string; paths: string[]; match: string; olderThanDays: number; tier: Tier };
 // staleDirs: children of `parent` other than the kept ones (target of `keep.symlink`, basename of `keep.cmd` output,
@@ -46,6 +46,7 @@ type Policy = {
   cleaners?: Cleaner[];
   archives?: Archive[];
   staleDirs?: StaleDirs[];
+  clones?: { namePatterns: string[]; idleDays: number };
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -305,6 +306,65 @@ function scanHousekeeping(policy: Policy, inUse: string[], items: Item[], exclud
   }
 }
 
+// One-off clones (backup copies, PR review checkouts): a name pattern or another clone of the same origin marks a
+// suspect; it is only proposed (always approve, never auto) when idle, clean, stash-free, with every commit on a
+// remote (or patch-equivalent upstream, or its branch's PR merged) and no open PR. Ignored files are listed.
+const normOrigin = (u: string) => u.trim().replace(/^[a-z+]+:\/\/([^@/]*@)?/i, "").replace(/^git@/, "").replace(":", "/").replace(/\.git$/, "").toLowerCase();
+function scanClones(policy: Policy, inUse: string[], items: Item[], excluded: Excluded[]) {
+  const cfg = policy.clones;
+  if (!cfg) return;
+  const patterns = cfg.namePatterns.map((p) => new RegExp(p, "i"));
+  const repos = findRepos(policy.roots).map((path) => ({ path, origin: git(path, "remote", "get-url", "origin").out.trim() }));
+  const byOrigin = new Map<string, string[]>();
+  repos.filter((r) => r.origin).forEach((r) => byOrigin.set(normOrigin(r.origin), [...(byOrigin.get(normOrigin(r.origin)) ?? []), r.path]));
+  // Each origin keeps one primary clone that is never proposed: the one named like the origin repo, else the newest commit.
+  const primary = new Map<string, string>();
+  for (const [o, paths] of byOrigin) {
+    const repoName = o.split("/").at(-1);
+    const newest = (p: string) => Number(git(p, "log", "-1", "--format=%ct").out.trim()) || 0;
+    primary.set(o, paths.find((p) => p.split("/").at(-1)?.toLowerCase() === repoName) ?? paths.reduce((a, b) => (newest(b) > newest(a) ? b : a)));
+  }
+  const hasGh = Bun.which("gh") != null;
+  for (const { path, origin } of repos) {
+    const name = path.split("/").at(-1)!;
+    const named = patterns.some((re) => re.test(name));
+    const twins = origin ? (byOrigin.get(normOrigin(origin)) ?? []).filter((p) => p !== path) : [];
+    if (!named && twins.length === 0) continue;
+    const exclude = (reason: string) => excluded.push({ kind: "clone", path, reason });
+    if (origin && primary.get(normOrigin(origin)) === path) { if (named) exclude("primary clone of its origin"); continue; }
+    if (underAny(path, policy.protect)) { exclude("protected path"); continue; }
+    if (inUse.some((c) => under(c, path))) { exclude("in use by a running process"); continue; }
+    if (!origin) { exclude("no origin remote; compare with the original by hand"); continue; }
+    if (git(path, "worktree", "list", "--porcelain").out.trim().split("\n\n").length > 1) { exclude("has linked worktrees"); continue; }
+    const commitMs = Number(git(path, "log", "-1", "--format=%ct").out.trim()) * 1000 || 0;
+    let indexMs = 0;
+    try { indexMs = statSync(join(path, ".git", "index")).mtimeMs; } catch {}
+    const idleDays = Math.floor((Date.now() - Math.max(commitMs, indexMs)) / DAY);
+    if (idleDays < cfg.idleDays) { exclude(`active ${idleDays}d ago`); continue; }
+    if (git(path, "status", "--porcelain").out.trim() !== "") { exclude("uncommitted changes"); continue; }
+    if (git(path, "stash", "list").out.trim() !== "") { exclude("has stashes"); continue; }
+    const branch = git(path, "rev-parse", "--abbrev-ref", "HEAD").out.trim();
+    const gh = (...args: string[]) => run(["gh", ...args], { cwd: path, timeoutMs: 30_000 });
+    const prs = (state: string) => { const r = gh("pr", "list", "--head", branch, "--state", state, "--json", "number"); return r.code === 0 ? (JSON.parse(r.out || "[]") as unknown[]).length : null; };
+    const unpushed = Number(git(path, "rev-list", "--count", "HEAD", "--not", "--remotes").out.trim() || "1");
+    let landed = unpushed === 0 ? "all commits on a remote" : "";
+    if (!landed) {
+      const cherry = git(path, "cherry", "origin/HEAD", "HEAD");
+      if (cherry.code === 0 && cherry.out.trim() !== "" && cherry.out.trim().split("\n").every((l) => l.startsWith("-"))) landed = "commits already upstream (git cherry)";
+    }
+    if (!hasGh) { exclude("gh not installed; cannot check pull requests"); continue; }
+    if (!landed && branch !== "HEAD" && (prs("merged") ?? 0) > 0) landed = `PR for ${branch} merged`;
+    if (!landed) { exclude(`${unpushed} commit(s) not on any remote`); continue; }
+    const open = branch === "HEAD" ? 0 : prs("open");
+    if (open == null) { exclude("gh pr list failed"); continue; }
+    if (open > 0) { exclude(`${open} open PR(s) for ${branch}`); continue; }
+    const ignored = git(path, "status", "--ignored", "--porcelain").out.split("\n").filter((l) => l.startsWith("!! ")).map((l) => l.slice(3));
+    const why = [named && "name pattern", twins.length && `same origin as ${twins.map(tilde).join(", ")}`].filter(Boolean).join("; ");
+    items.push({ tier: "approve", kind: "clone", path, bytes: duBytes(path), ignored,
+      reason: `${why}; clean, idle ${idleDays}d, ${landed}, no open PR${ignored.length ? `; ${ignored.length} ignored path(s) would be lost` : ""}` });
+  }
+}
+
 function scan(): Proposal {
   const policy = loadPolicy();
   const items: Item[] = [], excluded: Excluded[] = [], errors: string[] = [];
@@ -313,6 +373,7 @@ function scan(): Proposal {
   scanArtifacts(policy, worktrees, inUse, items, excluded, errors);
   scanCleaners(policy, items, excluded);
   scanHousekeeping(policy, inUse, items, excluded);
+  scanClones(policy, inUse, items, excluded);
   const now = new Date();
   const proposal: Proposal = {
     version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
@@ -405,7 +466,7 @@ function apply(id: string, tier: Tier) {
       if (r.code !== 0) failures.push({ path: f, error: r.err.trim() || `zstd exit ${r.code}` });
     }
   }
-  for (const i of selected.filter((i) => i.kind === "stale_dir")) {
+  for (const i of selected.filter((i) => i.kind === "stale_dir" || i.kind === "clone")) {
     try { rmSync(i.path, { recursive: true }); } catch (e) { failures.push({ path: i.path, error: String(e) }); }
   }
 
