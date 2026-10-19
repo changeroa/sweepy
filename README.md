@@ -30,6 +30,7 @@ bin/sweepy apply <id> --tier auto  # auto 등급 적용
 bin/sweepy check                   # launchd가 부르는 것: scan + auto(또는 shadow) + inbox
 bin/sweepy status                  # 여유 공간, 대기 중인 제안, 마지막 실행
 bin/sweepy report [--json]         # 디스크를 어디가 쓰는지 표(policy.report 대상 du, 큰 순)
+bin/sweepy dry-run [cleaner]       # cleaner별 예상 크기와 도구의 dry-run 출력(실제 정리는 하지 않음)
 bin/sweepy install | uninstall     # launchd(dev.sweepy.check) 등록/해제
 sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대화상자 점검
 ```
@@ -47,11 +48,18 @@ sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대
 | `auto.enabled` | `false`면 auto 등급을 기록만 한다. history의 shadow 기록을 보고 오판이 없으면 켠다 |
 | `inbox.minBytes` | 이 이상 모일 때만 inbox에 제안 |
 | `proposalTtlHours` | 제안 유효 시간 |
+| `cleaners[]` | 도구의 공식 prune을 감싼 플러그인. `{id, tier, detect, size, dryRun?, apply, shadow?, enabled?}`. 아래 참고 |
 | `report.paths` / `childrenOf` / `top` | `report`가 잴 경로, 하위 디렉터리를 하나씩 잴 부모, 표시할 행 수 |
 
 환경 변수: `SWEEPY_POLICY`, `SWEEPY_STATE_DIR`, `SWEEPY_VOID`, `SWEEPY_SCAN_TIMEOUT`(초), `SWEEPY_DU_TIMEOUT`(초, 기본 60), `SWEEPY_DU_CACHE_HOURS`(기본 24), `SWEEPY_INTERVAL`(초, install 때).
 
 크기 측정(`du -sk`)은 프로세스 마감 시간 안에서만 돈다(macOS엔 `timeout`이 없다). 결과는 `du-cache.json`에 경로별로 남기고, 디렉터리 자체의 mtime이 그대로이고 `SWEEPY_DU_CACHE_HOURS`보다 젊으면 다시 재지 않는다(최상위 mtime은 깊은 곳의 변화를 못 보므로 나이 제한이 있다). 출력·제안·로그·history에 나가는 원격 URL 자격증명(`https://user:token@`)과 GitHub 토큰은 `***`로 가린다.
+
+### cleaner
+
+`detect`(argv)가 성공해야 도구가 있는 것으로 본다. `size`는 세 가지 중 하나다: `{cmd, pattern?}`(출력에서 크기를 읽음, `pattern`의 첫 그룹), `{du: [경로]}`, `{duOf: argv}`(명령이 출력한 경로를 du). `apply`는 도구의 prune 명령이고 sweepy가 직접 파일을 지우지 않는다. `shadow: true`인 cleaner는 `auto.enabled`가 켜져 있어도 history에 기록만 한다. 적용하면 cleaner마다 `estimated`(size)와 `measured`(적용 전후 Data 볼륨 여유 공간 차이)를 history에 남긴다. uv/pnpm/npm의 size는 캐시 전체 크기라서 prune으로 실제 회수되는 양의 상한이다.
+
+기본 cleaner: brew(`brew cleanup --prune=30`), uv(`uv cache prune`), pnpm(`pnpm store prune`), npm(`npm cache verify`). 모두 auto + shadow로 시작한다.
 
 테스트: `bun test` (가짜 `du`/`void` 바이너리와 임시 디렉터리만 쓴다).
 
