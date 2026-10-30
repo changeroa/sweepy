@@ -102,6 +102,8 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 
 참조 파일 위치를 기준으로 한 `frames/0001.png`, `audio.wav` 같은 상대 경로도 보호한다. 참조된 렌더 디렉터리는 안의 파일을 따로 제안해서 우회하지 못한다. manifest의 `originalFilename`은 원본 식별 정보로만 취급하며 `localPath` 같은 실제 경로 참조와 구분한다.
 
+final·delivery·업로드·최근 변경·git 추적 등으로 렌더 폴더가 제외되면 안의 WAV나 프레임도 그 보호를 상속한다. 겹치는 `roots`에서 하위 파일을 먼저 스캔해도 보호된 폴더의 일부만 따로 제안하지 않는다.
+
 `source-manifest.json`/`proxy-manifest.json`의 `originalFilename`, `driveId`, `bytes` 또는 `remoteBytes`가 이름·정확한 크기와 맞는 원본은 기본 제외한다. `--include-originals` 스캔에서만 원격 ID와 **needed for future edits** 경고를 담아 제안한다. 참조·업로드 보호는 이 플래그로 풀리지 않는다. 적용도 기존 `apply <id>` 재스캔·승인 흐름이며 원본은 같은 플래그가 필요하다. 미디어는 auto가 될 수 없다. 승인된 경로 제거는 staleDirs와 같은 방식이고 출처 `media`로 실측한다.
 
 `dry-run media`는 제안·제외·총 bytes를 JSON으로, `report`는 이유·크기를 표로(`--json`은 `media` 필드), `status`는 inbox 미디어 상세를 보여 준다. 이 조회 명령은 apply를 호출하지 않는다.

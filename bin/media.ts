@@ -113,6 +113,11 @@ function renderFolders(entries: Entry[]): Set<string> {
 
 export function scanMedia(ctx: Context) {
   const items: MediaItem[] = [], excluded: Excluded[] = [], errors: string[] = [];
+  const protectedContainers = new Map<string, string>();
+  const exclude = (entry: Entry, reason: string) => {
+    excluded.push({ kind: "media", path: entry.path, reason });
+    if (entry.directory) protectedContainers.set(entry.path, reason);
+  };
   if (ctx.policy.enabled === false) return { items, excluded, errors, totalBytes: 0 };
   const roots = paths(ctx.policy.roots ?? ["~/projects/*/poc", "~/projects/*/out", "~/projects/*/renders", "~/projects/*/exports"]);
   const scratch = paths(ctx.policy.scratchRoots ?? ["~/.dori/state/downloads", "~/.dori/state/research", "/tmp"]);
@@ -178,8 +183,10 @@ export function scanMedia(ctx: Context) {
         const namedOriginal = originals.find((o) => o.originalFilename === basename(p));
         const original = originals.find((o) => o.originalFilename === basename(p) && (o.bytes === entry.size || o.remoteBytes === entry.size));
         const marker = descendants.map((e) => e.path.match(/^(.*?\/(?:final|delivery|uploaded|latest))(?:\/|$)/i)?.[1]).find(Boolean);
+        const inherited = [...protectedContainers].find(([container]) => p !== container && under(p, container));
         let reason: string | undefined;
-        if (ctx.protect.some((b) => under(p, b) || under(b, p))) reason = "protected path";
+        if (inherited) reason = `${inherited[1]} (protected container ${inherited[0]})`;
+        else if (ctx.protect.some((b) => under(p, b) || under(b, p))) reason = "protected path";
         else if (marker) reason = `${under(p, marker) ? "inside" : "contains"} ${basename(marker)}/: ${marker}`;
         else if (uploads.some((u) => under(u, p) || under(p, u))) reason = "uploaded source path";
         else if (latest.some((l) => under(p, l) || under(l, p))) reason = "latest series version";
@@ -209,9 +216,9 @@ export function scanMedia(ctx: Context) {
         if (!reason && namedOriginal && !original) reason = "original manifest size mismatch";
         if (!reason && original && !ctx.includeOriginals) reason = "originals off by default (--include-originals)";
         if (!reason && isScratch && entry.mtime > now - Math.max(1, ctx.policy.staleDays ?? 3) * DAY) reason = `scratch younger than ${Math.max(1, ctx.policy.staleDays ?? 3)}d`;
-        if (reason) { excluded.push({ kind: "media", path: p, reason }); continue; }
+        if (reason) { exclude(entry, reason); continue; }
         const measured = ctx.measure(p);
-        if (measured.bytes === null) { excluded.push({ kind: "media", path: p, reason: measured.timedOut ? "media size timed out" : "media size unavailable" }); continue; }
+        if (measured.bytes === null) { exclude(entry, measured.timedOut ? "media size timed out" : "media size unavailable"); continue; }
         if (measured.bytes < (ctx.policy.minBytes ?? 1024 * 1024)) continue;
         if (original && entry.size < (ctx.policy.originalMinBytes ?? 100 * 1024 * 1024)) continue;
         const why = original ? `re-downloadable original; remote ID ${original.driveId}; needed for future edits`
@@ -223,9 +230,20 @@ export function scanMedia(ctx: Context) {
     } catch (e) {
       // Discard any partial proposals from an incompletely inspected tree.
       for (let i = items.length - 1; i >= 0; i--) if (under(items[i]?.path ?? "", root)) items.splice(i, 1);
+      protectedContainers.set(root, String(e));
       excluded.push({ kind: "media", path: root, reason: String(e) });
       errors.push(String(e));
     }
+  }
+  // Root order must not let a narrow scan bypass a later container exclusion.
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (!item) continue;
+    const inherited = [...protectedContainers].find(([container]) => under(item.path, container));
+    if (!inherited) continue;
+    if (!excluded.some((e) => e.path === item.path))
+      excluded.push({ kind: "media", path: item.path, reason: `${inherited[1]} (protected container ${inherited[0]})` });
+    items.splice(i, 1);
   }
   return { items, excluded, errors, totalBytes: items.reduce((n, i) => n + i.bytes, 0) };
 }

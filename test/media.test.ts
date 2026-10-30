@@ -170,6 +170,8 @@ for (const marker of ["final", "delivery", "uploaded"]) {
     // Given an old series with a protected descendant and a newer version.
     const w = world();
     const protectedDir = w.render("trust-v1", `${marker}/clip.mp4`);
+    w.file(join(protectedDir, "audio.wav"));
+    w.file(join(protectedDir, "frames", "0001.png"));
     const eligible = w.render("trust-v2");
     w.render("trust-v3");
 
@@ -187,6 +189,8 @@ test("scan protects a render named by a configured upload-results JSON glob", as
   // Given an uploaded old render and a separate eligible old render.
   const w = world({ globs: true });
   const uploaded = w.render("trust-v1");
+  w.file(join(uploaded, "audio.wav"));
+  w.file(join(uploaded, "frames", "0001.png"));
   const eligible = w.render("trust-v2");
   w.render("trust-v3");
   writeFileSync(w.uploads, JSON.stringify({ uploads: [{ path: join(uploaded, "render.mp4"), videoId: "fixture-video", status: "uploaded" }] }));
@@ -267,6 +271,7 @@ test("scan uses recent descendant mtimes rather than only the old render directo
   // Given old ancestors containing a newly modified nested media file.
   const w = world();
   const recent = w.render("trust-v1", "frames/nested/frame.png");
+  w.file(join(recent, "audio.wav"));
   const eligible = w.render("trust-v2");
   w.render("trust-v3");
   const now = new Date();
@@ -284,6 +289,7 @@ test("scan protects git-tracked descendants using a real git index", async () =>
   // Given a real repository with one tracked old render and one untracked one.
   const w = world();
   const tracked = w.render("trust-v1");
+  w.file(join(tracked, "audio.wav"));
   const eligible = w.render("trust-v2");
   w.render("trust-v3");
   const init = await Bun.$`git init -q ${w.root}`.quiet();
@@ -482,6 +488,28 @@ test("a referenced render does not protect unrelated sibling versions", async ()
   expect(paths(result)).toEqual([eligible]);
 }, 30_000);
 
+for (const childFirst of [false, true]) {
+  test(`overlapping roots preserve protected containers with child-first=${childFirst}`, async () => {
+    // Given an independently scanned WAV inside a final-containing render.
+    const w = world();
+    const protectedDir = w.render("trust-v1", "final/clip.mp4");
+    const audio = w.file(join(protectedDir, "audio.wav"));
+    const eligible = w.render("trust-v2");
+    w.render("trust-v3");
+    const policy = JSON.parse(readFileSync(w.s.policyPath, "utf8"));
+    writeFileSync(w.s.policyPath, JSON.stringify({
+      ...policy, media: { ...policy.media, roots: childFirst ? [audio, w.root] : [w.root, audio] },
+    }));
+
+    // When either root is scanned first.
+    const result = await w.run<DryRun>(["dry-run", "media"]);
+
+    // Then the overlapping scan cannot bypass the protected parent.
+    expectProtected(result, protectedDir);
+    expect(paths(result)).toEqual([eligible]);
+  }, 30_000);
+}
+
 test("overlapping render and scratch roots never produce duplicate or nested proposals", async () => {
   // Given the same candidates visible through paths, globs, and two categories.
   const w = world({ overlap: true });
@@ -511,6 +539,7 @@ test("site capture frame packs remain source material without a rendered video",
   const frames = join(pack, "frames");
   w.file(join(frames, "scene-01-f0-y0000.png"));
   w.file(join(frames, "scene-01-text.txt"), "Captured website text");
+  w.file(join(frames, "audio.wav"));
   w.file(join(pack, "scenes.json"), JSON.stringify({ scenes: [{ id: 1 }] }));
   w.file(join(pack, "SCENEBOOK.md"), "# SceneBook\n");
   // An unrelated video elsewhere must not make every frames/ regenerable.
