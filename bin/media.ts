@@ -95,6 +95,13 @@ function reference(path: string, corpus: Text[], scope: string): string | undefi
     return false;
   }))?.path;
 }
+// A directory name alone does not establish regenerability: website captures
+// also use frames/. Require a rendered video and its edit metadata together.
+function renderFolders(entries: Entry[]): Set<string> {
+  const videos = new Set(entries.filter((e) => !e.directory && /\.(mp4|mov)$/i.test(e.path)).map((e) => dirname(e.path)));
+  return new Set(entries.filter((e) => !e.directory && /^(?:timeline\.json|(?:.*\.)?edit\.json)$/i.test(basename(e.path)))
+    .map((e) => dirname(e.path)).filter((p) => videos.has(p)));
+}
 
 export function scanMedia(ctx: Context) {
   const items: MediaItem[] = [], excluded: Excluded[] = [], errors: string[] = [];
@@ -146,6 +153,7 @@ export function scanMedia(ctx: Context) {
       }).map((e) => e.path);
       const originals = data.corpus.filter((t) => /(?:source|proxy)-manifest\.json$/.test(t.path)).flatMap((t) => objects(json(t)))
         .filter((o) => typeof o.driveId === "string" && typeof o.originalFilename === "string");
+      const rendered = renderFolders(data.entries);
       const candidates = entries.filter((e) => {
         if (isScratch) return !e.directory && mediaFile(e.path);
         if (e.directory) return (!!series(e.path) || /^(frames|phone-frames|proxies)$/.test(basename(e.path)))
@@ -158,9 +166,10 @@ export function scanMedia(ctx: Context) {
         const descendants = entry.directory ? entries.filter((e) => under(e.path, p)) : [entry];
         const namedOriginal = originals.find((o) => o.originalFilename === basename(p));
         const original = originals.find((o) => o.originalFilename === basename(p) && (o.bytes === entry.size || o.remoteBytes === entry.size));
+        const marker = descendants.map((e) => e.path.match(/^(.*?\/(?:final|delivery|uploaded|latest))(?:\/|$)/i)?.[1]).find(Boolean);
         let reason: string | undefined;
         if (ctx.protect.some((b) => under(p, b) || under(b, p))) reason = "protected path";
-        else if (descendants.some((e) => /(?:^|\/)(?:final|delivery|uploaded|latest)(?:\/|$)/i.test(e.path))) reason = "final/delivery/uploaded/latest media";
+        else if (marker) reason = `${under(p, marker) ? "inside" : "contains"} ${basename(marker)}/: ${marker}`;
         else if (uploads.some((u) => under(u, p) || under(p, u))) reason = "uploaded source path";
         else if (latest.some((l) => under(p, l) || under(l, p))) reason = "latest series version";
         else if (descendants.some((e) => e.symlink)) reason = "symlink requires manual review";
@@ -172,6 +181,11 @@ export function scanMedia(ctx: Context) {
           const ref = reference(p, [...corpora.values()].flatMap((d) => d.corpus), scope);
           if (ref) reason = `referenced_by ${ref}`;
         }
+        if (!reason && entry.directory && /^(frames|phone-frames)$/.test(basename(p))
+          && !rendered.has(dirname(p)) && !rendered.has(dirname(dirname(p))))
+          reason = "not a verified video render: frames may be source captures (requires rendered mp4/mov and timeline.json or *.edit.json)";
+        if (!reason && entry.directory && series(p) && ![...rendered].some((d) => under(d, p)))
+          reason = "not a verified video render: requires rendered mp4/mov and timeline.json or *.edit.json";
         if (!reason && namedOriginal && !original) reason = "original manifest size mismatch";
         if (!reason && original && !ctx.includeOriginals) reason = "originals off by default (--include-originals)";
         if (!reason && isScratch && entry.mtime > now - Math.max(1, ctx.policy.staleDays ?? 3) * DAY) reason = `scratch younger than ${Math.max(1, ctx.policy.staleDays ?? 3)}d`;

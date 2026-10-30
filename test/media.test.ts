@@ -67,6 +67,8 @@ function world(options: { enabled?: boolean; staleDays?: number; globs?: boolean
   const render = (name: string, leaf = "render.mp4") => {
     const path = join(root, "out", name);
     file(join(path, leaf));
+    if (leaf !== "render.mp4") file(join(path, "render.mp4"));
+    file(join(path, "timeline.json"), JSON.stringify({ segments: [] }));
     return path;
   };
   const run = async <T>(args: string[]): Promise<T> => {
@@ -177,6 +179,7 @@ for (const marker of ["final", "delivery", "uploaded"]) {
     // Then the entire protected directory stays out, not just its marked file.
     expect(paths(result)).toEqual([eligible]);
     expectProtected(result, protectedDir);
+    expect(result.excluded.find((item) => item.path === protectedDir)?.reason).toContain(join(protectedDir, marker));
   }, 30_000);
 }
 
@@ -237,6 +240,7 @@ for (const gitRepo of [false, true]) {
     // Then the whole v7 directory is protected even though v8 exists.
     expect(paths(result)).toEqual([eligible]);
     expectProtected(result, referenced);
+    expect(result.excluded.find((item) => item.path === referenced)?.reason).toContain(join(references, "templates", "layout.json"));
   }, 30_000);
 }
 
@@ -405,6 +409,8 @@ test("ordinary non-versioned intermediates are eligible but final delivery and l
   const wav = w.file(join(w.root, "work", "audio.wav"));
   const webm = w.file(join(w.root, "work", "preview.webm"));
   const proxy = w.file(join(w.root, "work", "proxy.mp4"));
+  w.file(join(w.root, "work", "render.mp4"));
+  w.file(join(w.root, "work", "timeline.json"), JSON.stringify({ segments: [] }));
   w.file(join(w.root, "work", "notes.txt"));
   for (const marker of ["final", "delivery", "latest"]) {
     w.file(join(w.root, marker, "frames", "0001.png"));
@@ -441,6 +447,43 @@ test("overlapping render and scratch roots never produce duplicate or nested pro
   expect(mediaItems(result).some((item) => under(item.path, latest))).toBe(false);
   expect(result.totalBytes).toBe(mediaItems(result).reduce((sum, item) => sum + (item.bytes ?? 0), 0));
 }, 30_000);
+
+test("site capture frame packs remain source material without a rendered video", async () => {
+  // Given point-in-time website captures, not regenerable video frames.
+  const w = world();
+  const pack = join(w.root, "out", "packs", "example");
+  const frames = join(pack, "frames");
+  w.file(join(frames, "scene-01-f0-y0000.png"));
+  w.file(join(frames, "scene-01-text.txt"), "Captured website text");
+  w.file(join(pack, "scenes.json"), JSON.stringify({ scenes: [{ id: 1 }] }));
+  w.file(join(pack, "SCENEBOOK.md"), "# SceneBook\n");
+  // An unrelated video elsewhere must not make every frames/ regenerable.
+  w.render("trust-v1");
+
+  // When discovering media under generic output roots.
+  const result = await w.run<Proposal>(["scan"]);
+
+  // Then the raw capture directory is explicitly excluded and left intact.
+  expectProtected(result, frames);
+  expect(existsSync(join(frames, "scene-01-text.txt"))).toBe(true);
+}, 30_000);
+
+for (const missing of ["video", "metadata"]) {
+  test(`frame directories require both render inputs when ${missing} is absent`, async () => {
+    // Given a frame directory with only half of the required render context.
+    const w = world();
+    const frames = join(w.root, "work", "phone-frames");
+    w.file(join(frames, "0001.png"));
+    if (missing !== "video") w.file(join(w.root, "work", "render.mov"));
+    if (missing !== "metadata") w.file(join(w.root, "work", "timeline.json"), "{}");
+
+    // When scanning candidate media.
+    const result = await w.run<Proposal>(["scan"]);
+
+    // Then neither naming nor a single marker proves regeneration is possible.
+    expectProtected(result, frames);
+  }, 30_000);
+}
 
 test("check queues media for approval and status reports it without auto-deleting", async () => {
   // Given auto enabled, media must still be approval-only.

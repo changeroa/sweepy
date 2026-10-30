@@ -96,7 +96,7 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 
 `media` 정책의 `roots`, `scratchRoots`, `uploadResults`는 경로·glob 목록이다. 기본 범위는 `~/projects/*/{poc,out,renders,exports}`, `~/.dori/state/{downloads,research}`, `/tmp`의 미디어다. `mp4/mov/mkv/webm/m4a/mp3/wav`와 PNG 프레임을 찾고 기존 timed du로 크기를 잰다. `staleDays` 기본 3, `minBytes` 기본 1 MiB, `originalMinBytes` 기본 100 MiB이며 `enabled: false`로 끈다.
 
-`trust-v1/v2/v3`, `biotokens-v10/v11/v12-hook`처럼 같은 부모·stem의 숫자 버전을 묶어 구버전을 제안한다. 버전 없는 폴더의 `frames/`, `phone-frames/`, `proxies/`, WAV·WebM·proxy 파일도 후보이며 scratch는 `staleDays`가 지나야 한다. `/tmp`는 바로 아래 파일만 본다.
+`trust-v1/v2/v3`, `biotokens-v10/v11/v12-hook`처럼 같은 부모·stem의 숫자 버전을 묶어 구버전을 제안한다. 렌더 폴더로 인정하려면 같은 디렉터리에 MP4/MOV 출력과 `timeline.json`/`edit.json`/`*.edit.json`이 함께 있어야 한다. 버전 폴더는 하위의 렌더 폴더를 확인하고, `frames/`·`phone-frames/`는 바로 위나 두 단계 위에서 이 쌍을 확인한다. 이름만 `frames/`인 폴더(예: site-compiler의 시점별 웹 캡처)는 재생성 가능한 영상 중간 산출물로 취급하지 않고 제외한다. `proxies/`, WAV·WebM·proxy 파일도 후보이며 scratch는 `staleDays`가 지나야 한다. `/tmp`는 바로 아래 파일만 본다.
 
 `final/`, `delivery/`, `uploaded/`, `latest/`, 업로드 결과의 `sourceVideoPath`/`video`/`sourcePath`(결과가 가리키는 manifest 포함), 계열 최신 버전, git 추적 파일, 24시간 안에 바뀐 파일은 제외한다. 디렉터리는 하위 파일까지 확인한다. 후보 밖 저장소 텍스트의 절대·상대 경로 참조는 `referenced_by`로 제외하므로 `out/four-shorts-v7-ref/phone-ui.png`를 쓰는 템플릿이 남아 있으면 그 렌더를 제안하지 않는다. 심볼릭 링크·읽기 실패·검사 한도 초과는 보수적으로 제외한다. 참조 검사는 `.git`, `node_modules`, `.venv`, `target`, `.next`를 제외하며 텍스트 파일당 16 MiB, 전체 텍스트 128 MiB, 트리당 100,000개·15초 한도다.
 
