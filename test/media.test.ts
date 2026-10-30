@@ -426,6 +426,62 @@ test("ordinary non-versioned intermediates are eligible but final delivery and l
   expect(paths(result)).toEqual([frames, phoneFrames, wav, webm, proxy].sort());
 }, 30_000);
 
+test("sibling timeline references protect local frames and audio paths", async () => {
+  // Given verified render context with paths relative to its own timeline.
+  const w = world();
+  const work = join(w.root, "work");
+  const frames = join(work, "frames");
+  const audio = w.file(join(work, "audio.wav"));
+  w.file(join(frames, "0001.png"));
+  w.file(join(work, "render.mp4"));
+  const timeline = w.file(join(work, "timeline.json"), JSON.stringify({ frame: "frames/0001.png", audio: "audio.wav" }));
+
+  // When checking ordinary intermediate candidates.
+  const result = await w.run<DryRun>(["dry-run", "media"]);
+
+  // Then local path references protect both directory and file candidates.
+  expectProtected(result, frames);
+  expectProtected(result, audio);
+  for (const path of [frames, audio])
+    expect(result.excluded.find((item) => item.path === path)?.reason).toContain(timeline);
+}, 30_000);
+
+for (const target of ["out/trust-v1", "out/trust-v1/render.mp4"]) {
+  test(`referenced render containers protect descendants when pointing at ${target}`, async () => {
+    // Given a referenced older render with otherwise eligible nested media.
+    const w = world();
+    const older = w.render("trust-v1", "frames/0001.png");
+    w.file(join(older, "audio.wav"));
+    w.render("trust-v2");
+    const reference = w.file(join(w.root, "templates", "layout.json"), JSON.stringify({ renderDir: target }));
+
+    // When scanning both the version container and its intermediate children.
+    const result = await w.run<DryRun>(["dry-run", "media"]);
+
+    // Then the excluded parent cannot be bypassed through its children.
+    expectProtected(result, older);
+    expect(result.excluded.find((item) => item.path === join(older, "audio.wav"))?.reason).toContain(reference);
+    expect(result.totalBytes).toBe(0);
+  }, 30_000);
+}
+
+test("a referenced render does not protect unrelated sibling versions", async () => {
+  // Given a root-level reference to only one of two older render versions.
+  const w = world();
+  const referenced = w.render("trust-v1");
+  w.file(join(referenced, "audio.wav"));
+  const eligible = w.render("trust-v2");
+  w.render("trust-v3");
+  w.file(join(w.root, "README.md"), "Use out/trust-v1\n");
+
+  // When ancestor references are inherited by individual intermediates.
+  const result = await w.run<Proposal>(["scan"]);
+
+  // Then protection stays with the referenced subtree, not its siblings.
+  expectProtected(result, referenced);
+  expect(paths(result)).toEqual([eligible]);
+}, 30_000);
+
 test("overlapping render and scratch roots never produce duplicate or nested proposals", async () => {
   // Given the same candidates visible through paths, globs, and two categories.
   const w = world({ overlap: true });

@@ -100,6 +100,8 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 
 `final/`, `delivery/`, `uploaded/`, `latest/`, 업로드 결과의 `sourceVideoPath`/`video`/`sourcePath`(결과가 가리키는 manifest 포함), 계열 최신 버전, git 추적 파일, 24시간 안에 바뀐 파일은 제외한다. 디렉터리는 하위 파일까지 확인한다. 후보 밖 저장소 텍스트의 절대·상대 경로 참조는 `referenced_by`로 제외하므로 `out/four-shorts-v7-ref/phone-ui.png`를 쓰는 템플릿이 남아 있으면 그 렌더를 제안하지 않는다. 심볼릭 링크·읽기 실패·검사 한도 초과는 보수적으로 제외한다. 참조 검사는 `.git`, `node_modules`, `.venv`, `target`, `.next`를 제외하며 텍스트 파일당 16 MiB, 전체 텍스트 128 MiB, 트리당 100,000개·15초 한도다.
 
+참조 파일 위치를 기준으로 한 `frames/0001.png`, `audio.wav` 같은 상대 경로도 보호한다. 참조된 렌더 디렉터리는 안의 파일을 따로 제안해서 우회하지 못한다. manifest의 `originalFilename`은 원본 식별 정보로만 취급하며 `localPath` 같은 실제 경로 참조와 구분한다.
+
 `source-manifest.json`/`proxy-manifest.json`의 `originalFilename`, `driveId`, `bytes` 또는 `remoteBytes`가 이름·정확한 크기와 맞는 원본은 기본 제외한다. `--include-originals` 스캔에서만 원격 ID와 **needed for future edits** 경고를 담아 제안한다. 참조·업로드 보호는 이 플래그로 풀리지 않는다. 적용도 기존 `apply <id>` 재스캔·승인 흐름이며 원본은 같은 플래그가 필요하다. 미디어는 auto가 될 수 없다. 승인된 경로 제거는 staleDirs와 같은 방식이고 출처 `media`로 실측한다.
 
 `dry-run media`는 제안·제외·총 bytes를 JSON으로, `report`는 이유·크기를 표로(`--json`은 `media` 필드), `status`는 inbox 미디어 상세를 보여 준다. 이 조회 명령은 apply를 호출하지 않는다.

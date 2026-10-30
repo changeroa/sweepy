@@ -8,7 +8,7 @@ export type MediaPolicy = {
   readonly originalMinBytes?: number;
 };
 type Entry = { readonly path: string; readonly directory: boolean; readonly mtime: number; readonly size: number; readonly symlink?: boolean };
-type Text = { readonly path: string; readonly text: string };
+type Text = { readonly path: string; readonly text: string; readonly dependencyText?: string };
 export type MediaItem = { readonly kind: "media"; readonly tier: "approve"; readonly path: string; readonly bytes: number; readonly reason: string };
 type Excluded = { readonly kind: "media"; readonly path: string; readonly reason: string };
 type Context = {
@@ -65,7 +65,12 @@ function texts(entries: Entry[]): Text[] {
     bytes += e.size;
     if (bytes > 128 * 1024 * 1024) throw new Error("media reference corpus exceeds 128 MiB");
     const buf = readFileSync(e.path);
-    if (!buf.includes(0)) out.push({ path: e.path, text: buf.toString("utf8") });
+    if (!buf.includes(0)) {
+      const text = buf.toString("utf8");
+      const dependencyText = /(?:source|proxy)-manifest\.json$/.test(e.path)
+        ? JSON.stringify(json({ path: e.path, text }), (key: string, value: unknown) => key === "originalFilename" ? undefined : value) : text;
+      out.push({ path: e.path, text, dependencyText });
+    }
   }
   return out;
 }
@@ -81,16 +86,19 @@ function repoFor(root: string): string {
   }
   return root;
 }
-function reference(path: string, corpus: Text[], scope: string): string | undefined {
-  const rel = relative(scope, path);
+function reference(path: string, corpus: Text[], scope: { root: string; exact: boolean }): string | undefined {
+  const rel = relative(scope.root, path);
   const parts = rel.split("/");
   const needles = [path, ...parts.map((_, i) => parts.slice(i).join("/"))].filter((n) => n.length > 3 && (n.includes("/") || !!series(path)));
-  return corpus.find((t) => !under(t.path, path) && needles.some((n) => {
-    let at = t.text.indexOf(n);
+  return corpus.find((t) => !under(t.path, path) && [...needles, relative(dirname(t.path), path)].some((n) => {
+    if (!n) return false;
+    const text = t.dependencyText ?? t.text;
+    let at = text.indexOf(n);
     while (at >= 0) {
-      const before = t.text[at - 1] ?? "", after = t.text[at + n.length] ?? "";
-      if (!/[\w.@-]/.test(before) && !/[\w.@-]/.test(after)) return true;
-      at = t.text.indexOf(n, at + 1);
+      const before = text[at - 1] ?? "", after = text[at + n.length] ?? "";
+      const descendant = after === "/" && !/^(?:["'`\s*]|$)/.test(text.slice(at + n.length + 1));
+      if (!/[\w.@-]/.test(before) && !/[\w.@-]/.test(after) && (!scope.exact || !descendant)) return true;
+      at = text.indexOf(n, at + 1);
     }
     return false;
   }))?.path;
@@ -154,12 +162,15 @@ export function scanMedia(ctx: Context) {
       const originals = data.corpus.filter((t) => /(?:source|proxy)-manifest\.json$/.test(t.path)).flatMap((t) => objects(json(t)))
         .filter((o) => typeof o.driveId === "string" && typeof o.originalFilename === "string");
       const rendered = renderFolders(data.entries);
+      const corpus = [...corpora.values()].flatMap((d) => d.corpus);
+      const referenceCache = new Map<string, string | undefined>();
       const candidates = entries.filter((e) => {
         if (isScratch) return !e.directory && mediaFile(e.path);
         if (e.directory) return (!!series(e.path) || /^(frames|phone-frames|proxies)$/.test(basename(e.path)))
           && entries.some((child) => !child.directory && under(child.path, e.path) && mediaFile(child.path));
         return mediaFile(e.path) && (/\.(wav|webm)$/i.test(e.path) || /proxy/i.test(basename(e.path)) || originals.some((o) => o.originalFilename === basename(e.path)));
       }).sort((a, b) => a.path.length - b.path.length);
+      const containers = new Set(candidates.filter((e) => e.directory).map((e) => e.path));
       for (const entry of candidates) {
         const p = entry.path;
         if (items.some((i) => under(p, i.path))) continue;
@@ -178,8 +189,17 @@ export function scanMedia(ctx: Context) {
         else if (descendants.some((e) => e.directory && readdirSync(e.path).some((n) => skip.has(n)))) reason = "unscanned protected subtree";
         else if (entry.directory && originals.some((o) => descendants.some((e) => basename(e.path) === o.originalFilename))) reason = "contains camera originals";
         else {
-          const ref = reference(p, [...corpora.values()].flatMap((d) => d.corpus), scope);
-          if (ref) reason = `referenced_by ${ref}`;
+          // A reference to a container protects independently eligible children too.
+          let ancestor = p;
+          while (under(ancestor, root)) {
+            const exact = ancestor !== p && !containers.has(ancestor);
+            const cacheKey = `${ancestor}|${exact ? "exact" : "tree"}`;
+            if (!referenceCache.has(cacheKey)) referenceCache.set(cacheKey, reference(ancestor, corpus, { root: scope, exact }));
+            const ref = referenceCache.get(cacheKey);
+            if (ref) { reason = `referenced_by ${ref} (${ancestor})`; break; }
+            if (ancestor === root) break;
+            ancestor = dirname(ancestor);
+          }
         }
         if (!reason && entry.directory && /^(frames|phone-frames)$/.test(basename(p))
           && !rendered.has(dirname(p)) && !rendered.has(dirname(dirname(p))))
