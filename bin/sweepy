@@ -2,6 +2,8 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
+import { scanMedia } from "./media";
+import type { MediaPolicy } from "./media";
 
 const HOME = homedir();
 const REPO = dirname(dirname(import.meta.path));
@@ -16,7 +18,7 @@ const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const DAY = 86_400_000;
 
 type Tier = "auto" | "approve";
-type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir" | "clone" | "brew_dup";
+type Kind = "artifact" | "worktree_remove" | "worktree_prune" | "cleaner" | "archive" | "stale_dir" | "clone" | "brew_dup" | "media";
 type Item = { tier: Tier; kind: Kind; path: string; repo?: string; bytes: number; reason: string; artifactKind?: string; shadow?: boolean; files?: string[]; ignored?: string[] };
 // archives: compress (zstd --rm, never delete) files matching `match` under `paths` untouched for olderThanDays and not open.
 type Archive = { id: string; paths: string[]; match: string; olderThanDays: number; tier: Tier };
@@ -54,6 +56,7 @@ type Policy = {
   brewDuplicates?: { tier: Tier };
   brew?: { allowVersionedRemoval?: boolean };
   referenceRoots?: string[];
+  media?: MediaPolicy;
 };
 
 // Credentials embedded in remote URLs (https://user:token@host) and bare GitHub tokens never leave the process.
@@ -465,6 +468,12 @@ function scanClones(policy: Policy, inUse: string[], items: Item[], excluded: Ex
   }
 }
 
+function mediaProposal(policy: Policy) {
+  return scanMedia({ policy: policy.media ?? { enabled: false }, protect: policy.protect,
+    includeOriginals: process.argv.includes("--include-originals"), measure: duMeasure,
+    gitFiles: (root) => git(root, "ls-files", "-z") });
+}
+
 function scan(): Proposal {
   const policy = loadPolicy();
   const items: Item[] = [], excluded: Excluded[] = [], errors: string[] = [];
@@ -475,6 +484,8 @@ function scan(): Proposal {
   scanHousekeeping(policy, inUse, items, excluded);
   scanClones(policy, inUse, items, excluded);
   scanBrewDuplicates(policy, items, excluded);
+  const media = mediaProposal(policy);
+  items.push(...media.items); excluded.push(...media.excluded); errors.push(...media.errors);
   const now = new Date();
   const proposal: Proposal = {
     version: 1, id: crypto.randomUUID(), host: hostname(), createdAt: now.toISOString(),
@@ -575,8 +586,8 @@ function apply(id: string, tier: Tier) {
       }
     });
   }
-  for (const i of selected.filter((i) => i.kind === "stale_dir" || i.kind === "clone")) {
-    measure(i.kind === "clone" ? "clone" : i.repo ?? "stale_dir", i.bytes, () => {
+  for (const i of selected.filter((i) => i.kind === "stale_dir" || i.kind === "clone" || i.kind === "media")) {
+    measure(i.kind === "media" ? "media" : i.kind === "clone" ? "clone" : i.repo ?? "stale_dir", i.bytes, () => {
       try { rmSync(i.path, { recursive: true }); } catch (e) { failures.push({ path: i.path, error: String(e) }); }
     });
   }
@@ -631,7 +642,8 @@ function status() {
   const pending = existsSync(inbox) ? readdirSync(inbox).filter((f) => f.endsWith(".json")).map((f) => {
     const q: Proposal = JSON.parse(readFileSync(join(inbox, f), "utf8"));
     const approve = q.items.filter((i) => i.tier === "approve");
-    return { id: q.id, expiresAt: q.expiresAt, items: approve.length, bytes: sum(approve) };
+    return { id: q.id, expiresAt: q.expiresAt, items: approve.length, bytes: sum(approve),
+      media: approve.filter((i) => i.kind === "media") };
   }) : [];
   const log = existsSync(join(STATE, "sweepy.log")) ? readFileSync(join(STATE, "sweepy.log"), "utf8").trim().split("\n").at(-1) : null;
   out({ free: freeSpace(), autoEnabled: loadPolicy().auto.enabled, pending, lastCheck: log, installed: existsSync(PLIST), accuracy: accuracy() });
@@ -685,7 +697,8 @@ function report(json: boolean) {
     return { path, bytes: m.bytes, timedOut: m.timedOut, cached: m.cached, modified, coverage };
   }).sort((a, b) => (b.bytes ?? -1) - (a.bytes ?? -1)).slice(0, cfg.top ?? 30);
   const disk = diskUsage();
-  if (json) return out({ disk, rows });
+  const media = mediaProposal(policy);
+  if (json) return out({ disk, rows, media });
   const gb = (b: number | null | undefined) => (b == null ? "?" : (b / 1e9).toFixed(1));
   const lines = [
     `disk: used ${gb(disk?.used_bytes)} GB, free ${gb(disk?.avail_bytes)} GB of ${gb(disk?.size_bytes)} GB`,
@@ -693,12 +706,16 @@ function report(json: boolean) {
     "| path | GB | modified | sweepy |",
     "|---|---|---|---|",
     ...rows.map((r) => `| ${tilde(r.path)} | ${r.timedOut ? `timeout >${DU_TIMEOUT_MS / 1000}s` : gb(r.bytes)} | ${r.modified} | ${r.coverage} |`),
+    "", "media (approve only):", "| path | GB | reason |", "|---|---|---|",
+    ...media.items.map((i) => `| ${tilde(i.path)} | ${gb(i.bytes)} | ${i.reason} |`),
+    ...media.errors.map((e) => `media scan error: ${e}`),
   ];
   console.log(redact(lines.join("\n")));
 }
 
 // Show what each cleaner would do, using its own dry-run command when it has one. Never runs `apply`.
 function dryRun(only?: string) {
+  if (only === "media") return out(mediaProposal(loadPolicy()));
   const results = (loadPolicy().cleaners ?? []).filter((c) => c.enabled !== false && (!only || c.id === only)).map((c) => {
     const missing = detect(c.detect);
     if (missing) return { id: c.id, installed: false, reason: missing };

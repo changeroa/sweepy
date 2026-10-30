@@ -287,5 +287,13 @@
   "brew": {
     "allowVersionedRemoval": false
   },
-  "referenceRoots": []
+  "referenceRoots": [],
+  "media": {
+    "roots": ["~/projects/*/poc", "~/projects/*/out", "~/projects/*/renders", "~/projects/*/exports"],
+    "scratchRoots": ["~/.dori/state/downloads", "~/.dori/state/research", "/tmp"],
+    "uploadResults": ["~/.dori/state/lane-results/*upload*.json"],
+    "staleDays": 3,
+    "minBytes": 1048576,
+    "originalMinBytes": 104857600
+  }
 }

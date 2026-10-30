@@ -1,6 +1,6 @@
 # sweepy
 
-개발 디스크에서 두 가지만 치운다: **빌드 산출물**(`node_modules`, `target`, `.next`, `__pycache__`)과 **git 워크트리**. 무엇을 지워도 되는지는 정책 파일이 정하고, sweepy는 제안을 만들고 승인된 것만 적용한다. 탐지·삭제는 [Void](https://github.com/eladbash/void)와 git이 하고, 사람과의 대화는 sweepy 밖(에이전트 세션)이 한다.
+개발 디스크의 **빌드 산출물**(`node_modules`, `target`, `.next`, `__pycache__`), **git 워크트리**, **캐시·영상 중간 산출물**을 정책에 따라 제안하고 승인된 것만 적용한다. 빌드 산출물·워크트리 탐지와 삭제는 [Void](https://github.com/eladbash/void)와 git이 하고, 사람과의 대화는 sweepy 밖(에이전트 세션)이 한다.
 
 ```
 launchd (1시간마다) ─▶ sweepy check
@@ -31,6 +31,8 @@ bin/sweepy check                   # launchd가 부르는 것: scan + auto(또�
 bin/sweepy status                  # 여유 공간, 대기 중인 제안, 마지막 실행
 bin/sweepy report [--json]         # 디스크를 어디가 쓰는지 표(policy.report 대상 du, 큰 순)
 bin/sweepy dry-run [cleaner]       # cleaner별 예상 크기와 도구의 dry-run 출력(실제 정리는 하지 않음)
+bin/sweepy dry-run media           # 영상 제안·제외 이유·총 크기만 확인(삭제 없음)
+bin/sweepy scan --include-originals # 원격 ID·이름·정확한 크기가 맞는 원본도 검토(항상 approve)
 bin/sweepy install | uninstall     # launchd(dev.sweepy.check) 등록/해제
 sh scripts/doctor.sh               # 설치·정책·스케줄·macOS 권한 대화상자 점검
 ```
@@ -89,6 +91,18 @@ docker(approve): Colima가 켜져 있을 때만(`colima status`). 크기는 `doc
 - `hf-models`: `~/.cache/huggingface/hub/models--*` 중 60일 넘게 읽지 않은 것.
 - `app-cache-aside`: `~/Library/Caches/Aside`, Aside가 꺼져 있을 때만. 다른 앱은 이름을 화이트리스트에 더해야 본다.
 - `brew-old-kegs`: Cellar의 각 formula에서 `/opt/homebrew/opt/<name>`이 가리키는 버전 외(오래된 formula라 `brew cleanup`이 건너뛰는 구버전).
+
+### 영상 산출물 (항상 approve)
+
+`media` 정책의 `roots`, `scratchRoots`, `uploadResults`는 경로·glob 목록이다. 기본 범위는 `~/projects/*/{poc,out,renders,exports}`, `~/.dori/state/{downloads,research}`, `/tmp`의 미디어다. `mp4/mov/mkv/webm/m4a/mp3/wav`와 PNG 프레임을 찾고 기존 timed du로 크기를 잰다. `staleDays` 기본 3, `minBytes` 기본 1 MiB, `originalMinBytes` 기본 100 MiB이며 `enabled: false`로 끈다.
+
+`trust-v1/v2/v3`, `biotokens-v10/v11/v12-hook`처럼 같은 부모·stem의 숫자 버전을 묶어 구버전을 제안한다. 버전 없는 폴더의 `frames/`, `phone-frames/`, `proxies/`, WAV·WebM·proxy 파일도 후보이며 scratch는 `staleDays`가 지나야 한다. `/tmp`는 바로 아래 파일만 본다.
+
+`final/`, `delivery/`, `uploaded/`, `latest/`, 업로드 결과의 `sourceVideoPath`/`video`/`sourcePath`(결과가 가리키는 manifest 포함), 계열 최신 버전, git 추적 파일, 24시간 안에 바뀐 파일은 제외한다. 디렉터리는 하위 파일까지 확인한다. 후보 밖 저장소 텍스트의 절대·상대 경로 참조는 `referenced_by`로 제외하므로 `out/four-shorts-v7-ref/phone-ui.png`를 쓰는 템플릿이 남아 있으면 그 렌더를 제안하지 않는다. 심볼릭 링크·읽기 실패·검사 한도 초과는 보수적으로 제외한다. 참조 검사는 `.git`, `node_modules`, `.venv`, `target`, `.next`를 제외하며 텍스트 파일당 16 MiB, 전체 텍스트 128 MiB, 트리당 100,000개·15초 한도다.
+
+`source-manifest.json`/`proxy-manifest.json`의 `originalFilename`, `driveId`, `bytes` 또는 `remoteBytes`가 이름·정확한 크기와 맞는 원본은 기본 제외한다. `--include-originals` 스캔에서만 원격 ID와 **needed for future edits** 경고를 담아 제안한다. 참조·업로드 보호는 이 플래그로 풀리지 않는다. 적용도 기존 `apply <id>` 재스캔·승인 흐름이며 원본은 같은 플래그가 필요하다. 미디어는 auto가 될 수 없다. 승인된 경로 제거는 staleDirs와 같은 방식이고 출처 `media`로 실측한다.
+
+`dry-run media`는 제안·제외·총 bytes를 JSON으로, `report`는 이유·크기를 표로(`--json`은 `media` 필드), `status`는 inbox 미디어 상세를 보여 준다. 이 조회 명령은 apply를 호출하지 않는다.
 
 ### 추정 정확도
 
